@@ -348,7 +348,7 @@ services:
 	require.Equal(t, []string{"type=docker"}, stringify(c.Targets[1].Outputs))
 	require.Equal(t, newBool(true), c.Targets[1].NoCache)
 	require.Equal(t, ptrstr("128MiB"), c.Targets[1].ShmSize)
-	require.Equal(t, []string{"nofile=1024:1024"}, c.Targets[1].Ulimits)
+	require.Equal(t, ulimits(t, "nofile=1024:1024"), c.Targets[1].Ulimits)
 }
 
 func TestComposeExtDedup(t *testing.T) {

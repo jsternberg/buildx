@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/docker/buildx/util/buildflags"
 	"github.com/moby/buildkit/util/entitlements"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -50,7 +51,7 @@ target "webapp" {
 		require.Equal(t, ptrstr("webDEP"), m["webapp"].Args["VAR_INHERITED"])
 		require.Equal(t, true, *m["webapp"].NoCache)
 		require.Equal(t, "128m", *m["webapp"].ShmSize)
-		require.Equal(t, []string{"nofile=1024:1024"}, m["webapp"].Ulimits)
+		require.Equal(t, ulimits(t, "nofile=1024:1024"), m["webapp"].Ulimits)
 		require.Nil(t, m["webapp"].Pull)
 
 		require.Equal(t, 1, len(g))
@@ -1688,7 +1689,7 @@ func TestAttestDuplicates(t *testing.T) {
 	ctx := context.TODO()
 
 	m, _, err := ReadTargets(ctx, []File{fp}, []string{"default"}, nil, nil, &EntitlementConf{})
-	require.Equal(t, []string{"type=sbom,foo=bar", "type=provenance,mode=max"}, m["default"].Attest)
+	require.Equal(t, []string{"type=provenance,mode=max", "type=sbom,foo=bar"}, stringify(m["default"].Attest))
 	require.NoError(t, err)
 
 	opts, err := TargetsToBuildOpt(m, &Input{})
@@ -1699,7 +1700,7 @@ func TestAttestDuplicates(t *testing.T) {
 	}, opts["default"].Attests)
 
 	m, _, err = ReadTargets(ctx, []File{fp}, []string{"default"}, []string{"*.attest=type=sbom,disabled=true"}, nil, &EntitlementConf{})
-	require.Equal(t, []string{"type=sbom,disabled=true", "type=provenance,mode=max"}, m["default"].Attest)
+	require.Equal(t, []string{"type=provenance,mode=max", "type=sbom,disabled=true"}, stringify(m["default"].Attest))
 	require.NoError(t, err)
 
 	opts, err = TargetsToBuildOpt(m, &Input{})
@@ -2026,4 +2027,12 @@ func stringify[V fmt.Stringer](values []V) []string {
 	}
 	sort.Strings(s)
 	return s
+}
+
+func ulimits(t *testing.T, s ...string) buildflags.Ulimits {
+	t.Helper()
+
+	ulimits, err := buildflags.ParseUlimits(s)
+	require.NoError(t, err)
+	return ulimits
 }

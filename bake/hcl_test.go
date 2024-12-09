@@ -627,6 +627,15 @@ func TestHCLAttrsCapsuleType(t *testing.T) {
 			{ id = "default" },
 			{ id = "key", paths = ["path/to/key"] },
 		]
+
+		ulimits = {
+			"core" = { soft = 4, hard = 8 },
+			"cpu" = { soft = 50 },
+			"data" = [ 10, 20 ],
+			"fsize" = [ 30 ],
+			"locks" = "15",
+			"memlock" = "25:35"
+		}
 	}
 	`)
 

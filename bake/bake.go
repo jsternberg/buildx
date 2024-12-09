@@ -699,7 +699,7 @@ type Target struct {
 	Inherits []string `json:"inherits,omitempty" hcl:"inherits,optional" cty:"inherits"`
 
 	Annotations      []string                `json:"annotations,omitempty" hcl:"annotations,optional" cty:"annotations"`
-	Attest           []string                `json:"attest,omitempty" hcl:"attest,optional" cty:"attest"`
+	Attest           buildflags.Attests      `json:"attest,omitempty" hcl:"attest,optional" cty:"attest"`
 	Context          *string                 `json:"context,omitempty" hcl:"context,optional" cty:"context"`
 	Contexts         map[string]string       `json:"contexts,omitempty" hcl:"contexts,optional" cty:"contexts"`
 	Dockerfile       *string                 `json:"dockerfile,omitempty" hcl:"dockerfile,optional" cty:"dockerfile"`
@@ -707,8 +707,8 @@ type Target struct {
 	Args             map[string]*string      `json:"args,omitempty" hcl:"args,optional" cty:"args"`
 	Labels           map[string]*string      `json:"labels,omitempty" hcl:"labels,optional" cty:"labels"`
 	Tags             []string                `json:"tags,omitempty" hcl:"tags,optional" cty:"tags"`
-	CacheFrom        buildflags.CacheOptions `json:"cache-from,omitempty"  hcl:"cache-from,optional" cty:"cache-from"`
-	CacheTo          buildflags.CacheOptions `json:"cache-to,omitempty"  hcl:"cache-to,optional" cty:"cache-to"`
+	CacheFrom        buildflags.CacheOptions `json:"cache-from,omitempty" hcl:"cache-from,optional" cty:"cache-from"`
+	CacheTo          buildflags.CacheOptions `json:"cache-to,omitempty" hcl:"cache-to,optional" cty:"cache-to"`
 	Target           *string                 `json:"target,omitempty" hcl:"target,optional" cty:"target"`
 	Secrets          buildflags.Secrets      `json:"secret,omitempty" hcl:"secret,optional" cty:"secret"`
 	SSH              buildflags.SSHKeys      `json:"ssh,omitempty" hcl:"ssh,optional" cty:"ssh"`
@@ -718,8 +718,8 @@ type Target struct {
 	NoCache          *bool                   `json:"no-cache,omitempty" hcl:"no-cache,optional" cty:"no-cache"`
 	NetworkMode      *string                 `json:"network,omitempty" hcl:"network,optional" cty:"network"`
 	NoCacheFilter    []string                `json:"no-cache-filter,omitempty" hcl:"no-cache-filter,optional" cty:"no-cache-filter"`
-	ShmSize          *string                 `json:"shm-size,omitempty" hcl:"shm-size,optional"`
-	Ulimits          []string                `json:"ulimits,omitempty" hcl:"ulimits,optional"`
+	ShmSize          *string                 `json:"shm-size,omitempty" hcl:"shm-size,optional" cty:"shm-size"`
+	Ulimits          buildflags.Ulimits      `json:"ulimits,omitempty" hcl:"ulimits,optional" cty:"ulimits"`
 	Call             *string                 `json:"call,omitempty" hcl:"call,optional" cty:"call"`
 	Entitlements     []string                `json:"entitlements,omitempty" hcl:"entitlements,optional" cty:"entitlements"`
 	// IMPORTANT: if you add more fields here, do not forget to update newOverrides/AddOverrides and docs/bake-reference.md.
@@ -737,7 +737,7 @@ var (
 
 func (t *Target) normalize() {
 	t.Annotations = removeDupesStr(t.Annotations)
-	t.Attest = removeAttestDupes(t.Attest)
+	t.Attest = t.Attest.Normalize()
 	t.Tags = removeDupesStr(t.Tags)
 	t.Secrets = t.Secrets.Normalize()
 	t.SSH = removeDupes(t.SSH)
@@ -746,7 +746,6 @@ func (t *Target) normalize() {
 	t.CacheTo = t.CacheTo.Normalize()
 	t.Outputs = t.Outputs.Normalize()
 	t.NoCacheFilter = removeDupesStr(t.NoCacheFilter)
-	t.Ulimits = removeDupesStr(t.Ulimits)
 
 	if t.NetworkMode != nil && *t.NetworkMode == "host" {
 		t.Entitlements = append(t.Entitlements, "network.host")
@@ -811,8 +810,7 @@ func (t *Target) Merge(t2 *Target) {
 		t.Annotations = append(t.Annotations, t2.Annotations...)
 	}
 	if t2.Attest != nil { // merge
-		t.Attest = append(t.Attest, t2.Attest...)
-		t.Attest = removeAttestDupes(t.Attest)
+		t.Attest = t.Attest.Merge(t2.Attest)
 	}
 	if t2.Secrets != nil { // merge
 		t.Secrets = t.Secrets.Merge(t2.Secrets)
@@ -848,7 +846,7 @@ func (t *Target) Merge(t2 *Target) {
 		t.ShmSize = t2.ShmSize
 	}
 	if t2.Ulimits != nil { // merge
-		t.Ulimits = append(t.Ulimits, t2.Ulimits...)
+		t.Ulimits = t.Ulimits.Merge(t2.Ulimits)
 	}
 	if t2.Description != "" {
 		t.Description = t2.Description
@@ -969,7 +967,11 @@ func (t *Target) AddOverrides(overrides map[string]Override, ent *EntitlementCon
 		case "annotations":
 			t.Annotations = append(t.Annotations, o.ArrValue...)
 		case "attest":
-			t.Attest = append(t.Attest, o.ArrValue...)
+			attest, err := parseArrValue[buildflags.Attest](o.ArrValue)
+			if err != nil {
+				return errors.Wrap(err, "invalid value for attest")
+			}
+			t.Attest = t.Attest.Merge(attest)
 		case "no-cache":
 			noCache, err := strconv.ParseBool(value)
 			if err != nil {
@@ -981,7 +983,11 @@ func (t *Target) AddOverrides(overrides map[string]Override, ent *EntitlementCon
 		case "shm-size":
 			t.ShmSize = &value
 		case "ulimits":
-			t.Ulimits = o.ArrValue
+			ulimits, err := buildflags.ParseUlimits(o.ArrValue)
+			if err != nil {
+				return err
+			}
+			t.Ulimits = ulimits
 		case "network":
 			t.NetworkMode = &value
 		case "pull":
@@ -1389,24 +1395,14 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 		}
 	}
 
-	attests, err := buildflags.ParseAttests(t.Attest)
-	if err != nil {
-		return nil, err
-	}
-	bo.Attests = controllerapi.CreateAttestations(attests)
+	bo.Attests = controllerapi.CreateAttestations(t.Attest.ToPB())
 
 	bo.SourcePolicy, err = build.ReadSourcePolicy()
 	if err != nil {
 		return nil, err
 	}
 
-	ulimits := dockeropts.NewUlimitOpt(nil)
-	for _, field := range t.Ulimits {
-		if err := ulimits.Set(field); err != nil {
-			return nil, err
-		}
-	}
-	bo.Ulimits = ulimits
+	bo.Ulimits = t.Ulimits.ToUlimitOpt()
 
 	for _, ent := range t.Entitlements {
 		bo.Allow = append(bo.Allow, entitlements.Entitlement(ent))
@@ -1464,21 +1460,15 @@ func removeDupesStr(s []string) []string {
 	return s[:i]
 }
 
-func removeAttestDupes(s []string) []string {
-	res := []string{}
+func removeAttestDupes(s []*buildflags.Attest) []*buildflags.Attest {
+	res := []*buildflags.Attest{}
 	m := map[string]int{}
-	for _, v := range s {
-		att, err := buildflags.ParseAttest(v)
-		if err != nil {
-			res = append(res, v)
-			continue
-		}
-
+	for _, att := range s {
 		if i, ok := m[att.Type]; ok {
-			res[i] = v
+			res[i] = att
 		} else {
 			m[att.Type] = len(res)
-			res = append(res, v)
+			res = append(res, att)
 		}
 	}
 	return res

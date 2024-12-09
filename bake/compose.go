@@ -109,14 +109,18 @@ func ParseCompose(cfgs []composetypes.ConfigFile, envs map[string]string) (*Conf
 				networkModeP = &networkMode
 			}
 
-			var ulimits []string
+			var ulimits buildflags.Ulimits
 			if s.Build.Ulimits != nil {
+				ulimits = make(map[string]*buildflags.Ulimit)
 				for n, u := range s.Build.Ulimits {
 					ulimit, err := units.ParseUlimit(fmt.Sprintf("%s=%d:%d", n, u.Soft, u.Hard))
 					if err != nil {
 						return nil, err
 					}
-					ulimits = append(ulimits, ulimit.String())
+					ulimits[ulimit.Name] = &buildflags.Ulimit{
+						Soft: ulimit.Soft,
+						Hard: ulimit.Hard,
+					}
 				}
 			}
 
