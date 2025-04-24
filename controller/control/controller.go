@@ -25,9 +25,3 @@ type BuildxController interface {
 	DisconnectProcess(ctx context.Context, ref, pid string) error
 	Inspect(ctx context.Context, ref string) (*controllerapi.InspectResponse, error)
 }
-
-type ControlOptions struct {
-	ServerConfig string
-	Root         string
-	Detach       bool
-}

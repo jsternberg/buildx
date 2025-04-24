@@ -104,8 +104,6 @@ type buildOptions struct {
 	exportPush   bool
 	exportLoad   bool
 
-	control.ControlOptions
-
 	invokeConfig *invokeConfig
 }
 
@@ -649,14 +647,6 @@ func buildCmd(dockerCli command.Cli, rootOpts *rootOptions, debugConfig *debug.D
 	flags.StringArrayVar(&options.attests, "attest", []string{}, `Attestation parameters (format: "type=sbom,generator=image")`)
 	flags.StringVar(&options.sbom, "sbom", "", `Shorthand for "--attest=type=sbom"`)
 	flags.StringVar(&options.provenance, "provenance", "", `Shorthand for "--attest=type=provenance"`)
-
-	if confutil.IsExperimental() {
-		// TODO: move this to debug command if needed
-		flags.StringVar(&options.Root, "root", "", "Specify root directory of server to connect")
-		flags.BoolVar(&options.Detach, "detach", false, "Detach buildx server (supported only on linux)")
-		flags.StringVar(&options.ServerConfig, "server-config", "", "Specify buildx server config file (used only when launching new server)")
-		cobrautil.MarkFlagsExperimental(flags, "root", "detach", "server-config")
-	}
 
 	flags.StringVar(&options.callFunc, "call", "build", `Set method for evaluating build ("check", "outline", "targets")`)
 	flags.VarPF(callAlias(&options.callFunc, "check"), "check", "", `Shorthand for "--call=check"`)
