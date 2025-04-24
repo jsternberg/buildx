@@ -50,10 +50,7 @@ func RootCmd(dockerCli command.Cli, children ...DebuggableCmd) *cobra.Command {
 			}
 
 			ctx := context.TODO()
-			c, err := controller.NewController(ctx, controlOptions, dockerCli, printer)
-			if err != nil {
-				return err
-			}
+			c := controller.NewController(ctx, dockerCli)
 			defer func() {
 				if err := c.Close(); err != nil {
 					logrus.Warnf("failed to close server connection %v", err)

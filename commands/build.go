@@ -433,10 +433,7 @@ func runControllerBuild(ctx context.Context, dockerCli command.Cli, opts *contro
 		// stdin must be usable for monitor
 		return nil, nil, errors.Errorf("Dockerfile or context from stdin is not supported with invoke")
 	}
-	c, err := controller.NewController(ctx, options.ControlOptions, dockerCli, printer)
-	if err != nil {
-		return nil, nil, err
-	}
+	c := controller.NewController(ctx, dockerCli)
 	defer func() {
 		if err := c.Close(); err != nil {
 			logrus.Warnf("failed to close server connection %v", err)
@@ -445,7 +442,7 @@ func runControllerBuild(ctx context.Context, dockerCli command.Cli, opts *contro
 
 	// NOTE: buildx server has the current working directory different from the client
 	// so we need to resolve paths to abosolute ones in the client.
-	opts, err = controllerapi.ResolveOptionPaths(opts)
+	opts, err := controllerapi.ResolveOptionPaths(opts)
 	if err != nil {
 		return nil, nil, err
 	}
