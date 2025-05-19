@@ -19,6 +19,7 @@ import (
 
 	"github.com/containerd/console"
 	"github.com/docker/buildx/build"
+	"github.com/docker/buildx/build/dap"
 	"github.com/docker/buildx/builder"
 	"github.com/docker/buildx/commands/debug"
 	"github.com/docker/buildx/controller"
@@ -105,6 +106,7 @@ type buildOptions struct {
 	exportLoad   bool
 
 	invokeConfig *invokeConfig
+	dapConfig    *dapConfig
 }
 
 func (o *buildOptions) toControllerOptions() (*cbuild.Options, error) {
@@ -353,15 +355,8 @@ func runBuild(ctx context.Context, dockerCli command.Cli, options buildOptions) 
 	}
 
 	done := timeBuildCommand(mp, attributes)
-	var resp *client.SolveResponse
-	var inputs *build.Inputs
-	var retErr error
-	if confutil.IsExperimental() {
-		resp, inputs, retErr = runControllerBuild(ctx, dockerCli, opts, options, printer)
-	} else {
-		resp, inputs, retErr = runBasicBuild(ctx, dockerCli, opts, printer)
-	}
 
+	resp, inputs, retErr := runControllerBuild(ctx, dockerCli, opts, options, printer)
 	if err := printer.Wait(); retErr == nil {
 		retErr = err
 	}
@@ -419,7 +414,7 @@ func getImageID(resp map[string]string) string {
 }
 
 func runBasicBuild(ctx context.Context, dockerCli command.Cli, opts *cbuild.Options, printer *progress.Printer) (*client.SolveResponse, *build.Inputs, error) {
-	resp, res, dfmap, err := cbuild.RunBuild(ctx, dockerCli, opts, dockerCli.In(), printer, false)
+	resp, res, dfmap, err := cbuild.RunBuild(ctx, dockerCli, opts, dockerCli.In(), printer, build.Handler{}, false)
 	if res != nil {
 		res.Done()
 	}
@@ -427,10 +422,43 @@ func runBasicBuild(ctx context.Context, dockerCli command.Cli, opts *cbuild.Opti
 }
 
 func runControllerBuild(ctx context.Context, dockerCli command.Cli, opts *cbuild.Options, options buildOptions, printer *progress.Printer) (*client.SolveResponse, *build.Inputs, error) {
-	if options.invokeConfig != nil && (options.dockerfileName == "-" || options.contextPath == "-") {
+	if !confutil.IsExperimental() {
+		return runBasicBuild(ctx, dockerCli, opts, printer)
+	}
+
+	if options.invokeConfig != nil {
+		if _, err := console.ConsoleFromFile(os.Stdin); err == nil {
+			return runInvokeBuild(ctx, dockerCli, opts, options, printer)
+		}
+	}
+
+	var h build.Handler
+	if options.dapConfig != nil {
+		conn := &ioConn{}
+		h = dap.New(conn)
+	}
+	h.OnStart()
+
+	resp, res, dfmap, retErr := cbuild.RunBuild(ctx, dockerCli, opts, dockerCli.In(), printer, h, false)
+	if res != nil {
+		res.Done()
+	}
+
+	exitCode := 0
+	if retErr != nil {
+		exitCode = 1
+	}
+	h.OnExit(exitCode)
+
+	return resp, dfmap, retErr
+}
+
+func runInvokeBuild(ctx context.Context, dockerCli command.Cli, opts *cbuild.Options, options buildOptions, printer *progress.Printer) (resp *client.SolveResponse, inputs *build.Inputs, retErr error) {
+	if options.dockerfileName == "-" || options.contextPath == "-" {
 		// stdin must be usable for monitor
 		return nil, nil, errors.Errorf("Dockerfile or context from stdin is not supported with invoke")
 	}
+
 	c := controller.NewController(ctx, dockerCli)
 	defer func() {
 		if err := c.Close(); err != nil {
@@ -438,34 +466,16 @@ func runControllerBuild(ctx context.Context, dockerCli command.Cli, opts *cbuild
 		}
 	}()
 
-	// NOTE: buildx server has the current working directory different from the client
-	// so we need to resolve paths to abosolute ones in the client.
-	opts, err := cbuild.ResolveOptionPaths(opts)
-	if err != nil {
-		return nil, nil, err
-	}
+	f := ioset.NewSingleForwarder()
+	f.SetReader(dockerCli.In())
+	pr, pw := io.Pipe()
+	f.SetWriter(pw, func() io.WriteCloser {
+		pw.Close() // propagate EOF
+		logrus.Debug("propagating stdin close")
+		return nil
+	})
 
-	var ref string
-	var retErr error
-	var resp *client.SolveResponse
-	var inputs *build.Inputs
-
-	var f *ioset.SingleForwarder
-	var pr io.ReadCloser
-	var pw io.WriteCloser
-	if options.invokeConfig == nil {
-		pr = dockerCli.In()
-	} else {
-		f = ioset.NewSingleForwarder()
-		f.SetReader(dockerCli.In())
-		pr, pw = io.Pipe()
-		f.SetWriter(pw, func() io.WriteCloser {
-			pw.Close() // propagate EOF
-			logrus.Debug("propagating stdin close")
-			return nil
-		})
-	}
-
+	var err error
 	resp, inputs, err = c.Build(ctx, opts, pr, printer)
 	if err != nil {
 		var be *controllererrors.BuildError
@@ -477,16 +487,14 @@ func runControllerBuild(ctx context.Context, dockerCli command.Cli, opts *cbuild
 		}
 	}
 
-	if options.invokeConfig != nil {
-		if err := pw.Close(); err != nil {
-			logrus.Debug("failed to close stdin pipe writer")
-		}
-		if err := pr.Close(); err != nil {
-			logrus.Debug("failed to close stdin pipe reader")
-		}
+	if err := pw.Close(); err != nil {
+		logrus.Debug("failed to close stdin pipe writer")
+	}
+	if err := pr.Close(); err != nil {
+		logrus.Debug("failed to close stdin pipe reader")
 	}
 
-	if options.invokeConfig != nil && options.invokeConfig.needsDebug(retErr) {
+	if options.invokeConfig.needsDebug(retErr) {
 		// Print errors before launching monitor
 		if err := printError(retErr, printer); err != nil {
 			logrus.Warnf("failed to print error information: %v", err)
@@ -497,7 +505,11 @@ func runControllerBuild(ctx context.Context, dockerCli command.Cli, opts *cbuild
 			pw2.Close() // propagate EOF
 			return nil
 		})
-		monitorBuildResult, err := options.invokeConfig.runDebug(ctx, ref, opts, c, pr2, os.Stdout, os.Stderr, printer)
+
+		// TODO: weird that this passes an empty string for ref but that's
+		// what the previous version did, possibly accidentally.
+		// Keep here until we figure out what's going on.
+		monitorBuildResult, err := options.invokeConfig.runDebug(ctx, "", opts, c, pr2, os.Stdout, os.Stderr, printer)
 		if err := pw2.Close(); err != nil {
 			logrus.Debug("failed to close monitor stdin pipe reader")
 		}
@@ -513,8 +525,7 @@ func runControllerBuild(ctx context.Context, dockerCli command.Cli, opts *cbuild
 			logrus.Warnf("close error: %v", err)
 		}
 	}
-
-	return resp, inputs, retErr
+	return resp, inputs, nil
 }
 
 func printError(err error, printer *progress.Printer) error {
@@ -572,12 +583,15 @@ func buildCmd(dockerCli command.Cli, rootOpts *rootOptions, debugConfig *debug.D
 			options.progress = cFlags.progress
 			cmd.Flags().VisitAll(checkWarnedFlags)
 
-			if debugConfig != nil && (debugConfig.InvokeFlag != "" || debugConfig.OnFlag != "") {
-				iConfig := new(invokeConfig)
-				if err := iConfig.parseInvokeConfig(debugConfig.InvokeFlag, debugConfig.OnFlag); err != nil {
-					return err
+			if debugConfig != nil {
+				options.dapConfig = new(dapConfig)
+				if debugConfig.InvokeFlag != "" || debugConfig.OnFlag != "" {
+					iConfig := new(invokeConfig)
+					if err := iConfig.parseInvokeConfig(debugConfig.InvokeFlag, debugConfig.OnFlag); err != nil {
+						return err
+					}
+					options.invokeConfig = iConfig
 				}
-				options.invokeConfig = iConfig
 			}
 
 			return runBuild(cmd.Context(), dockerCli, *options)
@@ -1083,6 +1097,8 @@ func (cfg *invokeConfig) parseInvokeConfig(invoke, on string) error {
 	return nil
 }
 
+type dapConfig struct{}
+
 func maybeJSONArray(v string) []string {
 	var list []string
 	if err := json.Unmarshal([]byte(v), &list); err == nil {
@@ -1138,4 +1154,14 @@ func otelErrorType(err error) string {
 		name = "canceled"
 	}
 	return name
+}
+
+type ioConn struct{}
+
+func (c *ioConn) Read(p []byte) (int, error) {
+	return os.Stdin.Read(p)
+}
+
+func (c *ioConn) Write(p []byte) (int, error) {
+	return os.Stdout.Write(p)
 }

@@ -138,75 +138,56 @@ func filterAvailableNodes(nodes []builder.Node) ([]builder.Node, error) {
 	return nil, err
 }
 
-func toRepoOnly(in string) (string, error) {
-	m := map[string]struct{}{}
-	p := strings.Split(in, ",")
-	for _, pp := range p {
-		n, err := reference.ParseNormalizedNamed(pp)
-		if err != nil {
-			return "", err
-		}
-		m[n.Name()] = struct{}{}
-	}
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	return strings.Join(out, ","), nil
-}
-
-func Build(ctx context.Context, nodes []builder.Node, opts map[string]Options, docker *dockerutil.Client, cfg *confutil.Config, w progress.Writer) (resp map[string]*client.SolveResponse, err error) {
-	return BuildWithResultHandler(ctx, nodes, opts, docker, cfg, w, nil)
-}
-
-func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opts map[string]Options, docker *dockerutil.Client, cfg *confutil.Config, w progress.Writer, resultHandleFunc func(driverIndex int, rCtx *ResultHandle)) (resp map[string]*client.SolveResponse, err error) {
-	if len(nodes) == 0 {
-		return nil, errors.Errorf("driver required for build")
-	}
-
-	nodes, err = filterAvailableNodes(nodes)
-	if err != nil {
-		return nil, errors.Wrapf(err, "no valid drivers found")
-	}
-
-	var noMobyDriver *driver.DriverHandle
+// findNonMobyDriver returns the first non-moby based driver.
+func findNonMobyDriver(nodes []builder.Node) *driver.DriverHandle {
 	for _, n := range nodes {
 		if !n.Driver.IsMobyDriver() {
-			noMobyDriver = n.Driver
-			break
+			return n.Driver
+		}
+	}
+	return nil
+}
+
+// warnOnNoOutput will check if the given nodes and options would result in an output
+// and prints a warning if it would not.
+func warnOnNoOutput(ctx context.Context, nodes []builder.Node, opts map[string]Options) {
+	// Return immediately if default load is explicitly disabled or a call
+	// function is used.
+	if noDefaultLoad() || !noCallFunc(opts) {
+		return
+	}
+
+	// Find the first non-moby driver and return if it either doesn't exist
+	// or if the driver has default load enabled.
+	noMobyDriver := findNonMobyDriver(nodes)
+	if noMobyDriver == nil || noMobyDriver.Features(ctx)[driver.DefaultLoad] {
+		return
+	}
+
+	// Produce a warning describing the targets affected.
+	var noOutputTargets []string
+	for name, opt := range opts {
+		if !opt.Linked && len(opt.Exports) == 0 {
+			noOutputTargets = append(noOutputTargets, name)
 		}
 	}
 
-	if noMobyDriver != nil && !noDefaultLoad() && noCallFunc(opts) {
-		var noOutputTargets []string
-		for name, opt := range opts {
-			if noMobyDriver.Features(ctx)[driver.DefaultLoad] {
-				continue
-			}
-
-			if !opt.Linked && len(opt.Exports) == 0 {
-				noOutputTargets = append(noOutputTargets, name)
-			}
-		}
-		if len(noOutputTargets) > 0 {
-			var warnNoOutputBuf bytes.Buffer
-			warnNoOutputBuf.WriteString("No output specified ")
-			if len(noOutputTargets) == 1 && noOutputTargets[0] == "default" {
-				warnNoOutputBuf.WriteString(fmt.Sprintf("with %s driver", noMobyDriver.Factory().Name()))
-			} else {
-				warnNoOutputBuf.WriteString(fmt.Sprintf("for %s target(s) with %s driver", strings.Join(noOutputTargets, ", "), noMobyDriver.Factory().Name()))
-			}
-			logrus.Warnf("%s. Build result will only remain in the build cache. To push result image into registry use --push or to load image into docker use --load", warnNoOutputBuf.String())
-		}
+	if len(noOutputTargets) == 0 {
+		return
 	}
 
-	drivers, err := resolveDrivers(ctx, nodes, opts, w)
-	if err != nil {
-		return nil, err
+	var warnNoOutputBuf bytes.Buffer
+	warnNoOutputBuf.WriteString("No output specified ")
+	if len(noOutputTargets) == 1 && noOutputTargets[0] == "default" {
+		warnNoOutputBuf.WriteString(fmt.Sprintf("with %s driver", noMobyDriver.Factory().Name()))
+	} else {
+		warnNoOutputBuf.WriteString(fmt.Sprintf("for %s target(s) with %s driver", strings.Join(noOutputTargets, ", "), noMobyDriver.Factory().Name()))
 	}
+	logrus.Warnf("%s. Build result will only remain in the build cache. To push result image into registry use --push or to load image into docker use --load", warnNoOutputBuf.String())
+}
 
+func newBuildRequests(ctx context.Context, docker *dockerutil.Client, cfg *confutil.Config, drivers map[string][]*resolvedNode, w progress.Writer, opts map[string]Options) (map[string][]*reqForNode, error) {
 	reqForNodes := make(map[string][]*reqForNode)
-	eg, ctx := errgroup.WithContext(ctx)
 
 	for k, opt := range opts {
 		multiDriver := len(drivers[k]) > 1
@@ -268,8 +249,10 @@ func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opts map[
 			}
 		}
 	}
+	return reqForNodes, nil
+}
 
-	// validate that all links between targets use same drivers
+func validateTargetLinks(reqForNodes map[string][]*reqForNode, drivers map[string][]*resolvedNode, opts map[string]Options) error {
 	for name := range opts {
 		dps := reqForNodes[name]
 		for i, dp := range dps {
@@ -279,8 +262,9 @@ func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opts map[
 					k2 := strings.TrimPrefix(v, "target:")
 					dps2, ok := drivers[k2]
 					if !ok {
-						return nil, errors.Errorf("failed to find target %s for context %s", k2, strings.TrimPrefix(k, "context:")) // should be validated before already
+						return errors.Errorf("failed to find target %s for context %s", k2, strings.TrimPrefix(k, "context:")) // should be validated before already
 					}
+
 					var found bool
 					for _, dp2 := range dps2 {
 						if dp2.driverIndex == dp.driverIndex {
@@ -289,11 +273,61 @@ func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opts map[
 						}
 					}
 					if !found {
-						return nil, errors.Errorf("failed to use %s as context %s for %s because targets build with different drivers", k2, strings.TrimPrefix(k, "context:"), name)
+						return errors.Errorf("failed to use %s as context %s for %s because targets build with different drivers", k2, strings.TrimPrefix(k, "context:"), name)
 					}
 				}
 			}
 		}
+	}
+	return nil
+}
+
+func toRepoOnly(in string) (string, error) {
+	m := map[string]struct{}{}
+	p := strings.Split(in, ",")
+	for _, pp := range p {
+		n, err := reference.ParseNormalizedNamed(pp)
+		if err != nil {
+			return "", err
+		}
+		m[n.Name()] = struct{}{}
+	}
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return strings.Join(out, ","), nil
+}
+
+func Build(ctx context.Context, nodes []builder.Node, opts map[string]Options, docker *dockerutil.Client, cfg *confutil.Config, w progress.Writer) (resp map[string]*client.SolveResponse, err error) {
+	return BuildWithResultHandler(ctx, nodes, opts, docker, cfg, w, Handler{})
+}
+
+func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opts map[string]Options, docker *dockerutil.Client, cfg *confutil.Config, w progress.Writer, h Handler) (resp map[string]*client.SolveResponse, err error) {
+	if len(nodes) == 0 {
+		return nil, errors.Errorf("driver required for build")
+	}
+
+	nodes, err = filterAvailableNodes(nodes)
+	if err != nil {
+		return nil, errors.Wrapf(err, "no valid drivers found")
+	}
+	warnOnNoOutput(ctx, nodes, opts)
+
+	drivers, err := resolveDrivers(ctx, nodes, opts, w)
+	if err != nil {
+		return nil, err
+	}
+
+	eg, ctx := errgroup.WithContext(ctx)
+	reqForNodes, err := newBuildRequests(ctx, docker, cfg, drivers, w, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	// validate that all links between targets use same drivers
+	if err := validateTargetLinks(reqForNodes, drivers, opts); err != nil {
+		return nil, err
 	}
 
 	sharedSessions, err := detectSharedMounts(ctx, reqForNodes)
@@ -487,10 +521,10 @@ func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opts map[
 					}
 					buildRef := fmt.Sprintf("%s/%s/%s", node.Builder, node.Name, so.Ref)
 					var rr *client.SolveResponse
-					if resultHandleFunc != nil {
+					if h.OnResult != nil {
 						var resultHandle *ResultHandle
 						resultHandle, rr, err = NewResultHandle(ctx, cc, *so, "buildx", buildFunc, ch)
-						resultHandleFunc(dp.driverIndex, resultHandle)
+						h.OnResult(dp.driverIndex, resultHandle)
 					} else {
 						span, ctx := tracing.StartSpan(ctx, "build")
 						rr, err = c.Build(ctx, *so, "buildx", buildFunc, ch)

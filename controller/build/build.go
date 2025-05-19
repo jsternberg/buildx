@@ -34,7 +34,7 @@ const defaultTargetName = "default"
 // NOTE: When an error happens during the build and this function acquires the debuggable *build.ResultHandle,
 // this function returns it in addition to the error (i.e. it does "return nil, res, err"). The caller can
 // inspect the result and debug the cause of that error.
-func RunBuild(ctx context.Context, dockerCli command.Cli, in *Options, inStream io.Reader, progress progress.Writer, generateResult bool) (*client.SolveResponse, *build.ResultHandle, *build.Inputs, error) {
+func RunBuild(ctx context.Context, dockerCli command.Cli, in *Options, inStream io.Reader, progress progress.Writer, h build.Handler, generateResult bool) (*client.SolveResponse, *build.ResultHandle, *build.Inputs, error) {
 	if in.NoCache && len(in.NoCacheFilter) > 0 {
 		return nil, nil, nil, errors.Errorf("--no-cache and --no-cache-filter cannot currently be used together")
 	}
@@ -192,7 +192,7 @@ func RunBuild(ctx context.Context, dockerCli command.Cli, in *Options, inStream 
 
 	var inputs *build.Inputs
 	buildOptions := map[string]build.Options{defaultTargetName: opts}
-	resp, res, err := buildTargets(ctx, dockerCli, nodes, buildOptions, progress, generateResult)
+	resp, res, err := buildTargets(ctx, dockerCli, nodes, buildOptions, progress, h, generateResult)
 	err = wrapBuildError(err, false)
 	if err != nil {
 		// NOTE: buildTargets can return *build.ResultHandle even on error.
@@ -209,23 +209,21 @@ func RunBuild(ctx context.Context, dockerCli command.Cli, in *Options, inStream 
 // NOTE: When an error happens during the build and this function acquires the debuggable *build.ResultHandle,
 // this function returns it in addition to the error (i.e. it does "return nil, res, err"). The caller can
 // inspect the result and debug the cause of that error.
-func buildTargets(ctx context.Context, dockerCli command.Cli, nodes []builder.Node, opts map[string]build.Options, progress progress.Writer, generateResult bool) (*client.SolveResponse, *build.ResultHandle, error) {
+func buildTargets(ctx context.Context, dockerCli command.Cli, nodes []builder.Node, opts map[string]build.Options, progress progress.Writer, h build.Handler, generateResult bool) (*client.SolveResponse, *build.ResultHandle, error) {
 	var res *build.ResultHandle
-	var resp map[string]*client.SolveResponse
-	var err error
 	if generateResult {
 		var mu sync.Mutex
 		var idx int
-		resp, err = build.BuildWithResultHandler(ctx, nodes, opts, dockerutil.NewClient(dockerCli), confutil.NewConfig(dockerCli), progress, func(driverIndex int, gotRes *build.ResultHandle) {
+		h.OnResult = func(driverIndex int, gotRes *build.ResultHandle) {
 			mu.Lock()
 			defer mu.Unlock()
 			if res == nil || driverIndex < idx {
 				idx, res = driverIndex, gotRes
 			}
-		})
-	} else {
-		resp, err = build.Build(ctx, nodes, opts, dockerutil.NewClient(dockerCli), confutil.NewConfig(dockerCli), progress)
+		}
 	}
+
+	resp, err := build.BuildWithResultHandler(ctx, nodes, opts, dockerutil.NewClient(dockerCli), confutil.NewConfig(dockerCli), progress, h)
 	if err != nil {
 		return nil, res, err
 	}
