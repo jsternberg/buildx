@@ -48,7 +48,9 @@ type Handler struct {
 	Attach            HandlerFunc[*dap.AttachRequest, *dap.AttachResponse]
 	Disconnect        HandlerFunc[*dap.DisconnectRequest, *dap.DisconnectResponse]
 	Terminate         HandlerFunc[*dap.TerminateRequest, *dap.TerminateResponse]
+	Continue          HandlerFunc[*dap.ContinueRequest, *dap.ContinueResponse]
 	Restart           HandlerFunc[*dap.RestartRequest, *dap.RestartResponse]
 	SetBreakpoints    HandlerFunc[*dap.SetBreakpointsRequest, *dap.SetBreakpointsResponse]
 	ConfigurationDone HandlerFunc[*dap.ConfigurationDoneRequest, *dap.ConfigurationDoneResponse]
+	Threads           HandlerFunc[*dap.ThreadsRequest, *dap.ThreadsResponse]
 }

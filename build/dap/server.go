@@ -157,6 +157,8 @@ func (s *Server) handleMessage(c Context, m dap.Message) (dap.ResponseMessage, e
 		return s.h.Launch.Do(c, req)
 	case *dap.AttachRequest:
 		return s.h.Attach.Do(c, req)
+	case *dap.ContinueRequest:
+		return s.h.Continue.Do(c, req)
 	default:
 		return nil, errors.New("not implemented")
 	}

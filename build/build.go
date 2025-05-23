@@ -343,6 +343,10 @@ func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opts map[
 	multiTarget := len(opts) > 1
 	childTargets := calculateChildTargets(reqForNodes, opts)
 
+	if h.Solve == nil {
+		h.Solve = Solve
+	}
+
 	for k, opt := range opts {
 		err := func(k string) (err error) {
 			opt := opt
@@ -475,19 +479,11 @@ func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opts map[
 							req.FrontendOpt["requestid"] = "frontend." + opt.CallFunc.Name
 						}
 
-						res, err := c.Solve(ctx, req)
+						res, err := h.Solve(ctx, c, req)
 						if err != nil {
-							req, ok := fallbackPrintError(err, req)
-							if ok {
-								res2, err2 := c.Solve(ctx, req)
-								if err2 != nil {
-									return nil, err
-								}
-								res = res2
-							} else {
-								return nil, err
-							}
+							return nil, err
 						}
+
 						if opt.CallFunc != nil {
 							callRes = res.Metadata
 						}
@@ -1179,4 +1175,21 @@ func ReadSourcePolicy() (*spb.Policy, error) {
 	}
 
 	return &pol, nil
+}
+
+func Solve(ctx context.Context, c gateway.Client, req gateway.SolveRequest) (*gateway.Result, error) {
+	res, err := c.Solve(ctx, req)
+	if err != nil {
+		req, ok := fallbackPrintError(err, req)
+		if ok {
+			res2, err2 := c.Solve(ctx, req)
+			if err2 != nil {
+				return nil, err
+			}
+			res = res2
+		} else {
+			return nil, err
+		}
+	}
+	return res, nil
 }
