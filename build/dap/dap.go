@@ -2,12 +2,15 @@ package dap
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"sync"
 
 	"github.com/docker/buildx/build"
 	"github.com/google/go-dap"
 	gateway "github.com/moby/buildkit/frontend/gateway/client"
+	"github.com/moby/buildkit/solver/errdefs"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -45,26 +48,18 @@ func New(rdwr io.ReadWriter) build.Handler {
 
 			eg.Wait()
 		},
-		Solve: func(ctx context.Context, c gateway.Client, req gateway.SolveRequest) (*gateway.Result, error) {
-			resCh := make(chan *gateway.Result, 1)
+		Evaluate: func(ctx context.Context, c gateway.Client, res *gateway.Result) error {
 			errCh := make(chan error, 1)
 
 			srv.Go(func(ctx Context) {
-				res, err := d.Solve(ctx, c, req)
-				if err != nil {
-					errCh <- err
-				} else {
-					resCh <- res
-				}
+				errCh <- d.Evaluate(ctx, c, res)
 			})
 
 			select {
-			case res := <-resCh:
-				return res, nil
 			case err := <-errCh:
-				return nil, err
+				return err
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return ctx.Err()
 			}
 		},
 	}
@@ -75,10 +70,39 @@ type debugAdapter struct {
 	started       chan struct{}
 	configuration chan struct{}
 
-	paused   chan struct{}
-	pausedMu sync.Mutex
+	evaluateReqCh chan *evaluateRequest
 
-	solveReqCh chan *solveRequest
+	threads      map[int]*thread
+	threadsMu    sync.RWMutex
+	nextThreadID int
+}
+
+type thread struct {
+	id   int
+	name string
+
+	paused chan struct{}
+	ref    gateway.Reference
+	mu     sync.Mutex
+}
+
+func (t *thread) Pause(c Context, reason, desc string) <-chan struct{} {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.paused == nil {
+		t.paused = make(chan struct{})
+	}
+
+	c.C() <- &dap.StoppedEvent{
+		Event: dap.Event{Event: "stopped"},
+		Body: dap.StoppedEventBody{
+			Reason:      reason,
+			Description: desc,
+			ThreadId:    t.id,
+		},
+	}
+	return t.paused
 }
 
 func newDebugAdapter() *debugAdapter {
@@ -86,7 +110,9 @@ func newDebugAdapter() *debugAdapter {
 		initialized:   make(chan struct{}),
 		started:       make(chan struct{}),
 		configuration: make(chan struct{}),
-		solveReqCh:    make(chan *solveRequest),
+		evaluateReqCh: make(chan *evaluateRequest),
+		threads:       make(map[int]*thread),
+		nextThreadID:  1,
 	}
 }
 
@@ -99,6 +125,21 @@ func (d *debugAdapter) Initialize(c Context, req *dap.InitializeRequest, resp *d
 }
 
 func (d *debugAdapter) Launch(c Context, req *dap.LaunchRequest, resp *dap.LaunchResponse) error {
+	d.start(c)
+	return nil
+}
+
+func (d *debugAdapter) Attach(c Context, req *dap.AttachRequest, resp *dap.AttachResponse) error {
+	d.start(c)
+	return nil
+}
+
+func (d *debugAdapter) Disconnect(c Context, req *dap.DisconnectRequest, resp *dap.DisconnectResponse) error {
+	close(d.evaluateReqCh)
+	return nil
+}
+
+func (d *debugAdapter) start(c Context) {
 	close(d.started)
 
 	// Send initialized event to tell the debug adapter
@@ -110,14 +151,6 @@ func (d *debugAdapter) Launch(c Context, req *dap.LaunchRequest, resp *dap.Launc
 	}
 
 	c.Go(d.launch)
-	return nil
-}
-
-func (d *debugAdapter) Attach(c Context, req *dap.AttachRequest, resp *dap.AttachResponse) error {
-	close(d.started)
-
-	c.Go(d.launch)
-	return nil
 }
 
 func (d *debugAdapter) Continue(c Context, req *dap.ContinueRequest, resp *dap.ContinueResponse) error {
@@ -161,96 +194,120 @@ func (d *debugAdapter) launch(c Context) {
 		select {
 		case <-c.Done():
 			return
-		case req := <-d.solveReqCh:
+		case req := <-d.evaluateReqCh:
 			if req == nil {
 				return
 			}
 
+			t := d.newThread(c)
 			c.Go(func(c Context) {
-				defer close(req.resCh)
+				defer d.deleteThread(c, t)
 				defer close(req.errCh)
-
-				res, err := d.solve(c, req.c, req.req)
-				if err != nil {
-					req.errCh <- err
-					return
-				}
-				req.resCh <- res
+				req.errCh <- d.evaluate(c, t, req.c, req.res)
 			})
 		}
 	}
 }
 
-type solveRequest struct {
+func (d *debugAdapter) newThread(ctx Context) (t *thread) {
+	d.threadsMu.Lock()
+	id := d.nextThreadID
+	t = &thread{
+		id:   id,
+		name: fmt.Sprintf("thread%d", id),
+	}
+	d.threads[t.id] = t
+	d.nextThreadID++
+	d.threadsMu.Unlock()
+
+	ctx.C() <- &dap.ThreadEvent{
+		Event: dap.Event{Event: "thread"},
+		Body: dap.ThreadEventBody{
+			Reason:   "started",
+			ThreadId: t.id,
+		},
+	}
+	return t
+}
+
+func (d *debugAdapter) deleteThread(ctx Context, t *thread) {
+	d.threadsMu.Lock()
+	delete(d.threads, t.id)
+	d.threadsMu.Unlock()
+
+	ctx.C() <- &dap.ThreadEvent{
+		Event: dap.Event{Event: "thread"},
+		Body: dap.ThreadEventBody{
+			Reason:   "exited",
+			ThreadId: t.id,
+		},
+	}
+}
+
+type evaluateRequest struct {
 	c     gateway.Client
-	req   gateway.SolveRequest
-	resCh chan<- *gateway.Result
+	res   *gateway.Result
 	errCh chan<- error
 }
 
-func (d *debugAdapter) solve(ctx Context, c gateway.Client, req gateway.SolveRequest) (*gateway.Result, error) {
-	// TODO: do debug things here such as catching errors.
-	return build.Solve(ctx, c, req)
+func (d *debugAdapter) evaluate(ctx Context, t *thread, c gateway.Client, res *gateway.Result) error {
+	return res.EachRef(func(ref gateway.Reference) error {
+		var paused <-chan struct{}
+		err := ref.Evaluate(ctx)
+		if err != nil {
+			var solveErr errdefs.SolveError
+			if errors.As(err, &solveErr) {
+				paused = t.Pause(ctx, "exception", "Encountered an error during build")
+			}
+		} else {
+			paused = t.Pause(ctx, "pause", "Build completed")
+		}
+
+		select {
+		case <-paused:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
 }
 
-func (d *debugAdapter) Solve(ctx context.Context, c gateway.Client, req gateway.SolveRequest) (*gateway.Result, error) {
-	resCh := make(chan *gateway.Result)
+func (d *debugAdapter) Evaluate(ctx context.Context, c gateway.Client, res *gateway.Result) error {
 	errCh := make(chan error)
 
 	// Send a solve request to the launch routine
 	// which will perform the solve in the context of the server.
-	sreq := &solveRequest{
+	ereq := &evaluateRequest{
 		c:     c,
-		req:   req,
-		resCh: resCh,
+		res:   res,
 		errCh: errCh,
 	}
 	select {
-	case d.solveReqCh <- sreq:
+	case d.evaluateReqCh <- ereq:
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return ctx.Err()
 	}
 
 	// Wait for the response.
 	select {
-	case res := <-resCh:
-		return res, nil
 	case err := <-errCh:
-		return nil, err
+		return err
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return ctx.Err()
 	}
 }
 
 func (d *debugAdapter) Threads(c Context, req *dap.ThreadsRequest, resp *dap.ThreadsResponse) error {
-	resp.Body.Threads = []dap.Thread{
-		{
-			Id:   1,
-			Name: "main",
-		},
+	d.threadsMu.RLock()
+	defer d.threadsMu.RUnlock()
+
+	for _, t := range d.threads {
+		resp.Body.Threads = append(resp.Body.Threads, dap.Thread{
+			Id:   t.id,
+			Name: t.name,
+		})
 	}
 	return nil
-}
-
-func (d *debugAdapter) Pause(c Context) <-chan struct{} {
-	d.pausedMu.Lock()
-	defer d.pausedMu.Unlock()
-
-	if d.paused == nil {
-		d.paused = make(chan struct{})
-	}
-
-	c.C() <- &dap.StoppedEvent{
-		Event: dap.Event{
-			Event: "stopped",
-		},
-		Body: dap.StoppedEventBody{
-			Reason:      "pause",
-			Description: "Build completed",
-			ThreadId:    1,
-		},
-	}
-	return d.paused
 }
 
 func (d *debugAdapter) Handler() Handler {

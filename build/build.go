@@ -343,10 +343,6 @@ func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opts map[
 	multiTarget := len(opts) > 1
 	childTargets := calculateChildTargets(reqForNodes, opts)
 
-	if h.Solve == nil {
-		h.Solve = Solve
-	}
-
 	for k, opt := range opts {
 		err := func(k string) (err error) {
 			opt := opt
@@ -479,7 +475,7 @@ func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opts map[
 							req.FrontendOpt["requestid"] = "frontend." + opt.CallFunc.Name
 						}
 
-						res, err := h.Solve(ctx, c, req)
+						res, err := Solve(ctx, c, req)
 						if err != nil {
 							return nil, err
 						}
@@ -491,28 +487,15 @@ func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opts map[
 						rKey := resultKey(dp.driverIndex, k)
 						results.Set(rKey, res)
 
-						if children, ok := childTargets[rKey]; ok && len(children) > 0 {
-							// wait for the child targets to register their LLB before evaluating
-							_, err := results.Get(ctx, children...)
-							if err != nil {
+						if children := childTargets[rKey]; len(children) > 0 {
+							if err := waitForChildren(ctx, c, res, h.Evaluate, results, children); err != nil {
 								return nil, err
 							}
-							// we need to wait until the child targets have completed before we can release
-							eg, ctx := errgroup.WithContext(ctx)
-							eg.Go(func() error {
-								return res.EachRef(func(ref gateway.Reference) error {
-									return ref.Evaluate(ctx)
-								})
-							})
-							eg.Go(func() error {
-								_, err := results.Get(ctx, children...)
-								return err
-							})
-							if err := eg.Wait(); err != nil {
+						} else if h.Evaluate != nil {
+							if err := h.Evaluate(ctx, c, res); err != nil {
 								return nil, err
 							}
 						}
-
 						return res, nil
 					}
 					buildRef := fmt.Sprintf("%s/%s/%s", node.Builder, node.Name, so.Ref)
@@ -1192,4 +1175,27 @@ func Solve(ctx context.Context, c gateway.Client, req gateway.SolveRequest) (*ga
 		}
 	}
 	return res, nil
+}
+
+func waitForChildren(ctx context.Context, c gateway.Client, res *gateway.Result, evaluate EvaluateFunc, results *waitmap.Map, children []string) error {
+	// wait for the child targets to register their LLB before evaluating
+	_, err := results.Get(ctx, children...)
+	if err != nil {
+		return err
+	}
+	// we need to wait until the child targets have completed before we can release
+	eg, ctx := errgroup.WithContext(ctx)
+	eg.Go(func() error {
+		if evaluate != nil {
+			return evaluate(ctx, c, res)
+		}
+		return res.EachRef(func(ref gateway.Reference) error {
+			return ref.Evaluate(ctx)
+		})
+	})
+	eg.Go(func() error {
+		_, err := results.Get(ctx, children...)
+		return err
+	})
+	return eg.Wait()
 }

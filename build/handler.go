@@ -9,9 +9,9 @@ import (
 type (
 	ResultFunc func(driverIndex int, rCtx *ResultHandle)
 
-	StartFunc func()
-	ExitFunc  func(exitCode int)
-	SolveFunc func(ctx context.Context, c gateway.Client, req gateway.SolveRequest) (*gateway.Result, error)
+	StartFunc    func()
+	ExitFunc     func(exitCode int)
+	EvaluateFunc func(ctx context.Context, c gateway.Client, res *gateway.Result) error
 )
 
 type Handler struct {
@@ -20,7 +20,6 @@ type Handler struct {
 	OnStart StartFunc
 	OnExit  ExitFunc
 
-	Solve    SolveFunc
 	Evaluate EvaluateFunc
 }
 
