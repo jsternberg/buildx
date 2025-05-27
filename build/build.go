@@ -463,7 +463,6 @@ func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opts map[
 					ch, done := progress.NewChannel(pw)
 					defer func() { <-done }()
 
-					cc := c
 					var callRes map[string][]byte
 					buildFunc := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
 						if opt.CallFunc != nil {
@@ -491,24 +490,19 @@ func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opts map[
 							if err := waitForChildren(ctx, c, res, h.Evaluate, results, children); err != nil {
 								return nil, err
 							}
-						} else if h.Evaluate != nil {
-							if err := h.Evaluate(ctx, c, res); err != nil {
-								return nil, err
-							}
+							// } else if h.Evaluate != nil {
+							// 	if err := h.Evaluate(ctx, c, res); err != nil {
+							// 		return nil, err
+							// 	}
 						}
 						return res, nil
 					}
 					buildRef := fmt.Sprintf("%s/%s/%s", node.Builder, node.Name, so.Ref)
-					var rr *client.SolveResponse
-					if h.OnResult != nil {
-						var resultHandle *ResultHandle
-						resultHandle, rr, err = NewResultHandle(ctx, cc, *so, "buildx", buildFunc, ch)
-						h.OnResult(dp.driverIndex, resultHandle)
-					} else {
-						span, ctx := tracing.StartSpan(ctx, "build")
-						rr, err = c.Build(ctx, *so, "buildx", buildFunc, ch)
-						tracing.FinishWithError(span, err)
-					}
+
+					span, ctx := tracing.StartSpan(ctx, "build")
+					rr, err := c.Build(ctx, *so, "buildx", buildFunc, ch)
+					tracing.FinishWithError(span, err)
+
 					if !so.Internal && desktop.BuildBackendEnabled() && node.Driver.HistoryAPISupported(ctx) {
 						if err != nil {
 							return &desktop.ErrorWithBuildRef{

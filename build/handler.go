@@ -7,11 +7,9 @@ import (
 )
 
 type (
-	ResultFunc   func(driverIndex int, rCtx *ResultHandle)
 	EvaluateFunc func(ctx context.Context, c gateway.Client, res *gateway.Result) error
 )
 
 type Handler struct {
-	OnResult ResultFunc
 	Evaluate EvaluateFunc
 }

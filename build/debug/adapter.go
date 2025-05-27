@@ -213,28 +213,25 @@ type evaluateRequest struct {
 
 func (d *Adapter) evaluate(ctx Context, t *thread, c gateway.Client, res *gateway.Result) error {
 	return res.EachRef(func(ref gateway.Reference) error {
-		var paused <-chan struct{}
-		err := ref.Evaluate(ctx)
-		if err != nil {
+		if err := ref.Evaluate(ctx); err != nil {
 			var solveErr errdefs.SolveError
 			if errors.As(err, &solveErr) {
-				paused = t.Pause(ctx, "exception", "Encountered an error during build")
+				paused := t.Pause(ctx, "exception", "Encountered an error during build")
+				select {
+				case <-paused:
+					return err
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 			}
-		} else {
-			paused = t.Pause(ctx, "pause", "Build completed")
-		}
-
-		select {
-		case <-paused:
 			return err
-		case <-ctx.Done():
-			return ctx.Err()
 		}
+		return nil
 	})
 }
 
 func (d *Adapter) Evaluate(ctx context.Context, c gateway.Client, res *gateway.Result) error {
-	errCh := make(chan error)
+	errCh := make(chan error, 1)
 
 	// Send a solve request to the launch routine
 	// which will perform the solve in the context of the server.
@@ -276,9 +273,13 @@ func (d *Adapter) Handler() build.Handler {
 		Evaluate: func(ctx context.Context, c gateway.Client, res *gateway.Result) error {
 			errCh := make(chan error, 1)
 
-			d.srv.Go(func(ctx Context) {
+			started := d.srv.Go(func(ctx Context) {
+				defer close(errCh)
 				errCh <- d.Evaluate(ctx, c, res)
 			})
+			if !started {
+				return context.Canceled
+			}
 
 			select {
 			case err := <-errCh:

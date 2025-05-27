@@ -1,19 +1,8 @@
 package debug
 
 import (
-	"context"
-	"os"
-
-	"github.com/containerd/console"
-	"github.com/docker/buildx/controller"
-	controllerapi "github.com/docker/buildx/controller/pb"
-	"github.com/docker/buildx/monitor"
 	"github.com/docker/buildx/util/cobrautil"
-	"github.com/docker/buildx/util/progress"
 	"github.com/docker/cli/cli/command"
-	"github.com/moby/buildkit/util/progress/progressui"
-	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
 
@@ -37,33 +26,7 @@ func RootCmd(dockerCli command.Cli, children ...DebuggableCmd) *cobra.Command {
 	var options DebugConfig
 
 	cmd := &cobra.Command{
-		Use:   "debug",
-		Short: "Start debugger",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			printer, err := progress.NewPrinter(context.TODO(), os.Stderr, progressui.DisplayMode(progressMode))
-			if err != nil {
-				return err
-			}
-
-			ctx := context.TODO()
-			c := controller.NewController(ctx, dockerCli)
-			defer func() {
-				if err := c.Close(); err != nil {
-					logrus.Warnf("failed to close server connection %v", err)
-				}
-			}()
-			con := console.Current()
-			if err := con.SetRaw(); err != nil {
-				return errors.Errorf("failed to configure terminal: %v", err)
-			}
-
-			_, err = monitor.RunMonitor(ctx, "", nil, &controllerapi.InvokeConfig{
-				Tty: true,
-			}, c, dockerCli.In(), os.Stdout, os.Stderr, printer)
-			con.Reset()
-			return err
-		},
+		Use: "debug",
 	}
 	cobrautil.MarkCommandExperimental(cmd)
 

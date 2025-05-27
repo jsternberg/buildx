@@ -27,55 +27,61 @@ func NewServer(h Handler) *Server {
 	return &Server{h: h}
 }
 
-func (a *Server) Serve(ctx context.Context, conn Conn) error {
+func (s *Server) Serve(ctx context.Context, conn Conn) error {
 	writeCh := make(chan dap.Message)
-	a.ch = writeCh
+	s.ch = writeCh
 
-	a.ctx, a.cancel = context.WithCancelCause(ctx)
+	s.ctx, s.cancel = context.WithCancelCause(ctx)
 
 	// Start an error group to handle server-initiated tasks.
-	a.eg, _ = errgroup.WithContext(a.ctx)
-	a.eg.Go(func() error {
-		<-a.ctx.Done()
-		return a.ctx.Err()
+	s.eg, _ = errgroup.WithContext(s.ctx)
+	s.eg.Go(func() error {
+		<-s.ctx.Done()
+		return s.ctx.Err()
 	})
 
-	eg, _ := errgroup.WithContext(a.ctx)
+	eg, _ := errgroup.WithContext(s.ctx)
 	eg.Go(func() error {
-		return a.readLoop(conn, eg)
-	})
-
-	eg.Go(func() error {
-		return a.writeLoop(conn, writeCh)
+		return s.readLoop(conn, eg)
 	})
 
 	eg.Go(func() error {
+		return s.writeLoop(conn, writeCh)
+	})
+
+	eg.Go(func() error {
+		// TODO: reevaluate this logic for shutting down
 		defer close(writeCh)
-		return a.eg.Wait()
+		err := s.eg.Wait()
+
+		s.mu.Lock()
+		s.ch = nil
+		s.mu.Unlock()
+		return err
 	})
 
 	return eg.Wait()
 }
 
-func (a *Server) readLoop(conn Conn, eg *errgroup.Group) error {
+func (s *Server) readLoop(conn Conn, eg *errgroup.Group) error {
 	for {
-		m, err := conn.RecvMsg(a.ctx)
+		m, err := conn.RecvMsg(s.ctx)
 		if err != nil {
 			return nil
 		}
 
 		switch m := m.(type) {
 		case dap.RequestMessage:
-			if ok := a.dispatch(m); !ok {
+			if ok := s.dispatch(m); !ok {
 				return nil
 			}
 		}
 	}
 }
 
-func (a *Server) dispatch(m dap.RequestMessage) bool {
+func (s *Server) dispatch(m dap.RequestMessage) bool {
 	fn := func(c Context) {
-		rmsg, err := a.handleMessage(c, m)
+		rmsg, err := s.handleMessage(c, m)
 		if err != nil {
 			rmsg = &dap.Response{}
 			rmsg.GetResponse().Message = err.Error()
@@ -85,7 +91,7 @@ func (a *Server) dispatch(m dap.RequestMessage) bool {
 		rmsg.GetResponse().Success = err == nil
 		c.C() <- rmsg
 	}
-	return a.Go(fn)
+	return s.Go(fn)
 }
 
 func (s *Server) handleMessage(c Context, m dap.Message) (dap.ResponseMessage, error) {
@@ -144,36 +150,43 @@ func (s *Server) writeLoop(conn Conn, respCh <-chan dap.Message) error {
 }
 
 func (s *Server) Go(fn func(c Context)) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	acquireChannel := func() (chan<- dap.Message, bool) {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
 
-	ch := s.ch
-	if ch == nil {
-		return false
+		return s.ch, s.ch != nil
 	}
 
 	ctx, cancel := context.WithCancel(s.ctx)
 	c := &dispatchContext{
 		Context: ctx,
 		srv:     s,
-		ch:      ch,
 	}
 
+	started := make(chan bool, 1)
 	s.eg.Go(func() error {
+		var ok bool
+		c.ch, ok = acquireChannel()
+		started <- ok
+
+		if c.ch == nil {
+			return nil
+		}
+
 		defer cancel()
 		fn(c)
 		return nil
 	})
-	return true
+	return <-started
 }
 
-func (a *Server) Stop() {
-	a.mu.Lock()
-	a.ch = nil
-	a.mu.Unlock()
-	a.cancel(nil)
+func (s *Server) Stop() {
+	s.mu.Lock()
+	s.ch = nil
+	s.mu.Unlock()
+	s.cancel(nil)
 }
 
-func (a *Server) Handler() build.Handler {
+func (s *Server) Handler() build.Handler {
 	return build.Handler{}
 }

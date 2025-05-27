@@ -22,10 +22,8 @@ import (
 	dap "github.com/docker/buildx/build/debug"
 	"github.com/docker/buildx/builder"
 	"github.com/docker/buildx/commands/debug"
-	"github.com/docker/buildx/controller"
 	cbuild "github.com/docker/buildx/controller/build"
 	"github.com/docker/buildx/controller/control"
-	controllererrors "github.com/docker/buildx/controller/errdefs"
 	controllerapi "github.com/docker/buildx/controller/pb"
 	"github.com/docker/buildx/monitor"
 	"github.com/docker/buildx/store"
@@ -34,7 +32,6 @@ import (
 	"github.com/docker/buildx/util/cobrautil"
 	"github.com/docker/buildx/util/confutil"
 	"github.com/docker/buildx/util/desktop"
-	"github.com/docker/buildx/util/ioset"
 	"github.com/docker/buildx/util/metricutil"
 	"github.com/docker/buildx/util/osutil"
 	"github.com/docker/buildx/util/progress"
@@ -413,124 +410,29 @@ func getImageID(resp map[string]string) string {
 	return dgst
 }
 
-func runBasicBuild(ctx context.Context, dockerCli command.Cli, opts *cbuild.Options, printer *progress.Printer) (*client.SolveResponse, *build.Inputs, error) {
-	resp, res, dfmap, err := cbuild.RunBuild(ctx, dockerCli, opts, dockerCli.In(), printer, build.Handler{}, false)
-	if res != nil {
-		res.Done()
-	}
-	return resp, dfmap, err
-}
-
 func runControllerBuild(ctx context.Context, dockerCli command.Cli, opts *cbuild.Options, options buildOptions, printer *progress.Printer) (*client.SolveResponse, *build.Inputs, error) {
-	if !confutil.IsExperimental() {
-		return runBasicBuild(ctx, dockerCli, opts, printer)
-	}
-
 	var h build.Handler
-	if options.invokeConfig != nil {
+	if confutil.IsExperimental() && options.invokeConfig != nil {
 		if in := dockerCli.In(); in.IsTerminal() {
 			adapter := dap.NewAdapter()
 			c1, c2 := dap.Pipe()
+
+			go runTerminal(dockerCli, c2, printer)
+
 			adapter.Start(ctx, c1)
-
-			rdwr := readWriter{
-				Reader: in,
-				Writer: dockerCli.Out(),
-			}
-			go runTerminal(rdwr, c2)
-
 			defer adapter.Stop()
 			h = adapter.Handler()
 		}
 	}
 
-	resp, res, dfmap, retErr := cbuild.RunBuild(ctx, dockerCli, opts, dockerCli.In(), printer, h, false)
-	if res != nil {
-		res.Done()
-	}
-	return resp, dfmap, retErr
+	return cbuild.RunBuild(ctx, dockerCli, opts, dockerCli.In(), printer, h, false)
 }
 
-func runTerminal(rdwr io.ReadWriter, conn dap.Conn) {
-	t := dap.NewTerminal(rdwr, "(buildx) ")
+func runTerminal(dockerCli command.Cli, conn dap.Conn, printer *progress.Printer) {
+	t := dap.NewTerminal(dockerCli, "(buildx) ", printer)
 	if err := t.Run(context.Background(), conn); err != nil && !errors.Is(err, io.EOF) {
-		fmt.Fprintf(rdwr, "fatal error: %s\n", err)
+		fmt.Fprintf(dockerCli.Err(), "fatal error: %s\n", err)
 	}
-}
-
-func runInvokeBuild(ctx context.Context, dockerCli command.Cli, opts *cbuild.Options, options buildOptions, printer *progress.Printer) (resp *client.SolveResponse, inputs *build.Inputs, retErr error) {
-	if options.dockerfileName == "-" || options.contextPath == "-" {
-		// stdin must be usable for monitor
-		return nil, nil, errors.Errorf("Dockerfile or context from stdin is not supported with invoke")
-	}
-
-	c := controller.NewController(ctx, dockerCli)
-	defer func() {
-		if err := c.Close(); err != nil {
-			logrus.Warnf("failed to close server connection %v", err)
-		}
-	}()
-
-	f := ioset.NewSingleForwarder()
-	f.SetReader(dockerCli.In())
-	pr, pw := io.Pipe()
-	f.SetWriter(pw, func() io.WriteCloser {
-		pw.Close() // propagate EOF
-		logrus.Debug("propagating stdin close")
-		return nil
-	})
-
-	var err error
-	resp, inputs, err = c.Build(ctx, opts, pr, printer)
-	if err != nil {
-		var be *controllererrors.BuildError
-		if errors.As(err, &be) {
-			retErr = err
-			// We can proceed to monitor
-		} else {
-			return nil, nil, errors.Wrapf(err, "failed to build")
-		}
-	}
-
-	if err := pw.Close(); err != nil {
-		logrus.Debug("failed to close stdin pipe writer")
-	}
-	if err := pr.Close(); err != nil {
-		logrus.Debug("failed to close stdin pipe reader")
-	}
-
-	if options.invokeConfig.needsDebug(retErr) {
-		// Print errors before launching monitor
-		if err := printError(retErr, printer); err != nil {
-			logrus.Warnf("failed to print error information: %v", err)
-		}
-
-		pr2, pw2 := io.Pipe()
-		f.SetWriter(pw2, func() io.WriteCloser {
-			pw2.Close() // propagate EOF
-			return nil
-		})
-
-		// TODO: weird that this passes an empty string for ref but that's
-		// what the previous version did, possibly accidentally.
-		// Keep here until we figure out what's going on.
-		monitorBuildResult, err := options.invokeConfig.runDebug(ctx, "", opts, c, pr2, os.Stdout, os.Stderr, printer)
-		if err := pw2.Close(); err != nil {
-			logrus.Debug("failed to close monitor stdin pipe reader")
-		}
-		if err != nil {
-			logrus.Warnf("failed to run monitor: %v", err)
-		}
-		if monitorBuildResult != nil {
-			// Update return values with the last build result from monitor
-			resp, retErr = monitorBuildResult.Resp, monitorBuildResult.Err
-		}
-	} else {
-		if err := c.Close(); err != nil {
-			logrus.Warnf("close error: %v", err)
-		}
-	}
-	return resp, inputs, nil
 }
 
 func printError(err error, printer *progress.Printer) error {
@@ -1159,9 +1061,4 @@ func otelErrorType(err error) string {
 		name = "canceled"
 	}
 	return name
-}
-
-type readWriter struct {
-	io.Reader
-	io.Writer
 }

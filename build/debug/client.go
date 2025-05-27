@@ -63,10 +63,14 @@ func NewClient(conn Conn) *Client {
 				delete(c.requests, req)
 				c.requestsMu.Unlock()
 
-				ch <- m
+				if ch != nil {
+					ch <- m
+				}
 			case dap.EventMessage:
 				fn := c.events[m.GetEvent().Event]
-				fn(m)
+				if fn != nil {
+					fn(m)
+				}
 			}
 		}
 	})

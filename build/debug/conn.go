@@ -29,13 +29,18 @@ func Pipe() (Conn, Conn) {
 	ch1 := make(chan dap.Message, 100)
 	ch2 := make(chan dap.Message, 100)
 
+	ctx, cancel := context.WithCancel(context.Background())
 	conn1 := &conn{
 		recvCh: ch1,
 		sendCh: ch2,
+		ctx:    ctx,
+		cancel: cancel,
 	}
 	conn2 := &conn{
 		recvCh: ch2,
 		sendCh: ch1,
+		ctx:    ctx,
+		cancel: cancel,
 	}
 	return conn1, conn2
 }
