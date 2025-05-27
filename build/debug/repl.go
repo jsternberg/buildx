@@ -10,6 +10,8 @@ import (
 	"github.com/docker/buildx/monitor/types"
 	"github.com/google/go-dap"
 	"github.com/google/shlex"
+	"github.com/pkg/errors"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/term"
 )
 
@@ -29,55 +31,123 @@ func NewTerminal(rdwr io.ReadWriter, prompt string) *Terminal {
 }
 
 func (t *Terminal) Run(ctx context.Context, conn Conn) error {
-	conn.SendMsg(&dap.InitializeRequest{})
+	client := NewClient(conn)
+	defer client.Close()
+
+	eg, _ := errgroup.WithContext(ctx)
+
+	client.RegisterEvent("initialized", func(_ dap.EventMessage) {
+		eg.Go(func() error {
+			// Wait for the initialized event and send configuration done.
+			// We don't perform any additional configuration.
+			select {
+			case res := <-client.Do(&dap.ConfigurationDoneRequest{}):
+				if !res.GetResponse().Success {
+					return errors.New(res.GetResponse().Message)
+				}
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+	})
+
+	resCh := client.Do(&dap.InitializeRequest{})
+	select {
+	case res := <-resCh:
+		if !res.GetResponse().Success {
+			return errors.New(res.GetResponse().Message)
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	resCh = client.Do(&dap.LaunchRequest{})
+	select {
+	case res := <-resCh:
+		if !res.GetResponse().Success {
+			return errors.New(res.GetResponse().Message)
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	eg.Go(func() error {
+		return t.repl(ctx)
+	})
+
+	return eg.Wait()
+}
+
+func (t *Terminal) repl(ctx context.Context) error {
+	lineCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+
+	defer close(lineCh)
+	defer close(errCh)
 
 	for {
-		l, err := t.t.ReadLine()
-		if err != nil {
-			if err != io.EOF {
-				return err
+		// Read line may potentially never return so we invoke it in a goroutine
+		// that can be orphaned if needed.
+		go func() {
+			l, err := t.t.ReadLine()
+			if err != nil {
+				errCh <- err
+				return
 			}
-			return nil
-		}
+			lineCh <- l
+		}()
 
-		args, err := shlex.Split(l)
-		if err != nil {
-			fmt.Fprintf(t.t, "monitor: failed to parse command: %v\n", err)
-			continue
-		} else if len(args) == 0 {
-			continue
-		}
-
-		// Builtin commands
-		switch args[0] {
-		case "":
-			// nop
-			continue
-		case "exit":
-			return nil
-		case "help":
-			if len(args) >= 2 {
-				t.printHelpMessageOfCommand(args[1])
-				continue
+		select {
+		case l := <-lineCh:
+			if exit := t.invoke(ctx, l); exit {
+				return nil
 			}
-			t.printHelpMessage()
-			continue
-		default:
-			t.invoke(ctx, args[0], args)
+		case err := <-errCh:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 }
 
-func (t *Terminal) invoke(ctx context.Context, cmd string, args []string) {
+func (t *Terminal) invoke(ctx context.Context, l string) (exit bool) {
+	args, err := shlex.Split(l)
+	if err != nil {
+		fmt.Fprintf(t.t, "monitor: failed to parse command: %v\n", err)
+		return
+	} else if len(args) == 0 {
+		return
+	}
+
+	// Builtin commands
+	switch args[0] {
+	case "":
+		// nop
+		return
+	case "exit":
+		return true
+	case "help":
+		if len(args) >= 2 {
+			t.printHelpMessageOfCommand(args[1])
+			return
+		}
+		t.printHelpMessage()
+		return
+	default:
+	}
+
 	// Registered commands
+	cmd := args[0]
 	if cm, ok := t.registeredCommands[cmd]; ok {
 		if err := cm.Exec(ctx, args); err != nil {
 			fmt.Fprintf(t.t, "%s: %v\n", cmd, err)
 		}
 	} else {
-		fmt.Fprintf(t.t, "monitor: unknown command: %q\n", cmd)
+		fmt.Fprintf(t.t, "monitor: unknown command: %q\n", l)
 		t.printHelpMessage()
 	}
+	return
 }
 
 func (t *Terminal) printHelpMessageOfCommand(name string) {

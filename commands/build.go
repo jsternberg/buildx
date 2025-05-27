@@ -431,7 +431,7 @@ func runControllerBuild(ctx context.Context, dockerCli command.Cli, opts *cbuild
 		if in := dockerCli.In(); in.IsTerminal() {
 			adapter := dap.NewAdapter()
 			c1, c2 := dap.Pipe()
-			adapter.Start(c1)
+			adapter.Start(ctx, c1)
 
 			rdwr := readWriter{
 				Reader: in,
