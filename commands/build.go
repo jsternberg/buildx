@@ -19,7 +19,7 @@ import (
 
 	"github.com/containerd/console"
 	"github.com/docker/buildx/build"
-	"github.com/docker/buildx/build/dap"
+	dap "github.com/docker/buildx/build/debug"
 	"github.com/docker/buildx/builder"
 	"github.com/docker/buildx/commands/debug"
 	"github.com/docker/buildx/controller"
@@ -434,7 +434,7 @@ func runControllerBuild(ctx context.Context, dockerCli command.Cli, opts *cbuild
 
 	var h build.Handler
 	if options.dapConfig != nil {
-		adapter := dap.New()
+		adapter := dap.NewAdapter()
 		adapter.Start(ctx, &ioConn{})
 		defer adapter.Stop()
 
