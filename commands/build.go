@@ -434,27 +434,17 @@ func runControllerBuild(ctx context.Context, dockerCli command.Cli, opts *cbuild
 
 	var h build.Handler
 	if options.dapConfig != nil {
-		conn := &ioConn{}
-		h = dap.New(conn)
-	}
+		adapter := dap.New()
+		adapter.Start(ctx, &ioConn{})
+		defer adapter.Stop()
 
-	if h.OnStart != nil {
-		h.OnStart()
+		h = adapter.Handler()
 	}
 
 	resp, res, dfmap, retErr := cbuild.RunBuild(ctx, dockerCli, opts, dockerCli.In(), printer, h, false)
 	if res != nil {
 		res.Done()
 	}
-
-	if h.OnExit != nil {
-		exitCode := 0
-		if retErr != nil {
-			exitCode = 1
-		}
-		h.OnExit(exitCode)
-	}
-
 	return resp, dfmap, retErr
 }
 
