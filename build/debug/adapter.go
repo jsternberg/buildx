@@ -16,6 +16,7 @@ import (
 type Adapter struct {
 	srv *Server
 	eg  *errgroup.Group
+	cfg Config
 
 	initialized   chan struct{}
 	started       chan struct{}
@@ -28,8 +29,9 @@ type Adapter struct {
 	nextThreadID int
 }
 
-func NewAdapter() *Adapter {
+func NewAdapter(cfg Config) *Adapter {
 	d := &Adapter{
+		cfg:           cfg,
 		initialized:   make(chan struct{}),
 		started:       make(chan struct{}),
 		configuration: make(chan struct{}),
@@ -209,7 +211,7 @@ type evaluateRequest struct {
 
 func (d *Adapter) evaluate(ctx Context, t *thread, c gateway.Client, res *gateway.Result) error {
 	return res.EachRef(func(ref gateway.Reference) error {
-		if err := ref.Evaluate(ctx); err != nil {
+		if err := ref.Evaluate(ctx); err != nil && d.cfg.SuspendOn.OnError() {
 			var solveErr errdefs.SolveError
 			if errors.As(err, &solveErr) {
 				paused := t.Pause(ctx, "exception", "Encountered an error during build")
@@ -221,6 +223,15 @@ func (d *Adapter) evaluate(ctx Context, t *thread, c gateway.Client, res *gatewa
 				}
 			}
 			return err
+		}
+
+		if d.cfg.SuspendOn == SuspendAlways {
+			paused := t.Pause(ctx, "pause", "Result built")
+			select {
+			case <-paused:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 		return nil
 	})

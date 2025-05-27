@@ -414,7 +414,19 @@ func runControllerBuild(ctx context.Context, dockerCli command.Cli, opts *cbuild
 	var h build.Handler
 	if confutil.IsExperimental() && options.invokeConfig != nil {
 		if in := dockerCli.In(); in.IsTerminal() {
-			adapter := dap.NewAdapter()
+			cfg := dap.Config{}
+			switch options.invokeConfig.onFlag {
+			case "error":
+				cfg.SuspendOn = dap.SuspendError
+			case "always":
+				cfg.SuspendOn = dap.SuspendAlways
+			case "never":
+				cfg.SuspendOn = dap.SuspendNever
+			default:
+				fmt.Fprintf(dockerCli.Err(), "Error: --on=%s not recognized, using --on=error as the default.\n", options.invokeConfig.onFlag)
+			}
+
+			adapter := dap.NewAdapter(cfg)
 			c1, c2 := dap.Pipe()
 
 			go runTerminal(dockerCli, c2, printer)
