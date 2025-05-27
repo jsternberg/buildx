@@ -490,10 +490,10 @@ func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opts map[
 							if err := waitForChildren(ctx, c, res, h.Evaluate, results, children); err != nil {
 								return nil, err
 							}
-							// } else if h.Evaluate != nil {
-							// 	if err := h.Evaluate(ctx, c, res); err != nil {
-							// 		return nil, err
-							// 	}
+						} else if h.Evaluate != nil {
+							if err := h.Evaluate(ctx, c, res); err != nil {
+								return nil, err
+							}
 						}
 						return res, nil
 					}

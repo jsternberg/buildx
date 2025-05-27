@@ -108,6 +108,14 @@ func (s *Server) handleMessage(c Context, m dap.Message) (dap.ResponseMessage, e
 		return s.h.Attach.Do(c, req)
 	case *dap.ContinueRequest:
 		return s.h.Continue.Do(c, req)
+	case *dap.DisconnectRequest:
+		return s.h.Disconnect.Do(c, req)
+	case *dap.TerminateRequest:
+		return s.h.Terminate.Do(c, req)
+	case *dap.ConfigurationDoneRequest:
+		return s.h.ConfigurationDone.Do(c, req)
+	case *dap.ThreadsRequest:
+		return s.h.Threads.Do(c, req)
 	default:
 		return nil, errors.New("not implemented")
 	}

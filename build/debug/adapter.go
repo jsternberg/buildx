@@ -104,15 +104,6 @@ func (d *Adapter) Disconnect(c Context, req *dap.DisconnectRequest, resp *dap.Di
 
 func (d *Adapter) start(c Context) {
 	close(d.started)
-
-	// Send initialized event to tell the debug adapter
-	// to send configuration.
-	c.C() <- &dap.InitializedEvent{
-		Event: dap.Event{
-			Event: "initialized",
-		},
-	}
-
 	c.Go(d.launch)
 }
 
@@ -161,11 +152,16 @@ func (d *Adapter) launch(c Context) {
 			}
 
 			t := d.newThread(c)
-			c.Go(func(c Context) {
+			started := c.Go(func(c Context) {
 				defer d.deleteThread(c, t)
 				defer close(req.errCh)
 				req.errCh <- d.evaluate(c, t, req.c, req.res)
 			})
+
+			if !started {
+				req.errCh <- context.Canceled
+				close(req.errCh)
+			}
 		}
 	}
 }

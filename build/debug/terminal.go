@@ -15,6 +15,7 @@ import (
 	"github.com/google/shlex"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/term"
 )
 
 var additionalHelpMessages = map[string]string{
@@ -115,7 +116,6 @@ func (t *Terminal) run(ctx context.Context) error {
 			return ctx.Err()
 		}
 
-		fmt.Println("starting repl")
 		if err := t.repl(ctx); err != nil {
 			return err
 		}
@@ -123,57 +123,56 @@ func (t *Terminal) run(ctx context.Context) error {
 }
 
 func (t *Terminal) repl(ctx context.Context) error {
-	panic("implement me")
-	// if err := t.printer.Pause(); err != nil {
-	// 	return err
-	// }
-	// defer t.printer.Unpause()
-	//
-	// in := t.dockerCli.In()
-	// out := t.dockerCli.Out()
-	//
-	// if err := in.SetRawTerminal(); err != nil {
-	// 	return err
-	// }
-	//
-	// defer in.RestoreTerminal()
-	//
-	// rdwr := readWriter{
-	// 	Reader: in,
-	// 	Writer: out,
-	// }
-	//
-	// prompt := term.NewTerminal(rdwr, t.prompt)
-	//
-	// lineCh := make(chan string, 1)
-	// errCh := make(chan error, 1)
-	//
-	// defer close(lineCh)
-	// defer close(errCh)
-	//
-	// for {
-	// 	// Read line may potentially never return so we invoke it in a goroutine
-	// 	// that can be orphaned if needed.
-	// 	go func() {
-	// 		l, err := prompt.ReadLine()
-	// 		if err != nil {
-	// 			errCh <- err
-	// 			return
-	// 		}
-	// 		lineCh <- l
-	// 	}()
-	//
-	// 	select {
-	// 	case l := <-lineCh:
-	// 		if resume, err := t.invoke(ctx, t.dockerCli.Out(), l); resume || err != nil {
-	// 			return err
-	// 		}
-	// 	case err := <-errCh:
-	// 		return err
-	// 	case <-ctx.Done():
-	// 		return ctx.Err()
-	// 	}
-	// }
+	if err := t.printer.Pause(); err != nil {
+		return err
+	}
+	defer t.printer.Unpause()
+
+	in := t.dockerCli.In()
+	out := t.dockerCli.Out()
+
+	if err := in.SetRawTerminal(); err != nil {
+		return err
+	}
+
+	defer in.RestoreTerminal()
+
+	rdwr := readWriter{
+		Reader: in,
+		Writer: out,
+	}
+
+	prompt := term.NewTerminal(rdwr, t.prompt)
+
+	lineCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+
+	defer close(lineCh)
+	defer close(errCh)
+
+	for {
+		// Read line may potentially never return so we invoke it in a goroutine
+		// that can be orphaned if needed.
+		go func() {
+			l, err := prompt.ReadLine()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			lineCh <- l
+		}()
+
+		select {
+		case l := <-lineCh:
+			if resume, err := t.invoke(ctx, t.dockerCli.Out(), l); resume || err != nil {
+				return err
+			}
+		case err := <-errCh:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 func (t *Terminal) invoke(ctx context.Context, out io.Writer, l string) (resume bool, err error) {
