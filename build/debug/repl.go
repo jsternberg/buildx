@@ -8,6 +8,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/docker/buildx/monitor/types"
+	"github.com/google/go-dap"
 	"github.com/google/shlex"
 	"golang.org/x/term"
 )
@@ -28,6 +29,8 @@ func NewTerminal(rdwr io.ReadWriter, prompt string) *Terminal {
 }
 
 func (t *Terminal) Run(ctx context.Context, conn Conn) error {
+	conn.SendMsg(&dap.InitializeRequest{})
+
 	for {
 		l, err := t.t.ReadLine()
 		if err != nil {

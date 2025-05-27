@@ -426,19 +426,22 @@ func runControllerBuild(ctx context.Context, dockerCli command.Cli, opts *cbuild
 		return runBasicBuild(ctx, dockerCli, opts, printer)
 	}
 
-	if options.invokeConfig != nil {
-		if _, err := console.ConsoleFromFile(os.Stdin); err == nil {
-			return runInvokeBuild(ctx, dockerCli, opts, options, printer)
-		}
-	}
-
 	var h build.Handler
-	if options.dapConfig != nil {
-		adapter := dap.NewAdapter()
-		adapter.Start(ctx, &ioConn{})
-		defer adapter.Stop()
+	if options.invokeConfig != nil {
+		if in := dockerCli.In(); in.IsTerminal() {
+			adapter := dap.NewAdapter()
+			c1, c2 := dap.Pipe()
+			adapter.Start(c1)
 
-		h = adapter.Handler()
+			rdwr := readWriter{
+				Reader: in,
+				Writer: dockerCli.Out(),
+			}
+			go runTerminal(rdwr, c2)
+
+			defer adapter.Stop()
+			h = adapter.Handler()
+		}
 	}
 
 	resp, res, dfmap, retErr := cbuild.RunBuild(ctx, dockerCli, opts, dockerCli.In(), printer, h, false)
@@ -446,6 +449,13 @@ func runControllerBuild(ctx context.Context, dockerCli command.Cli, opts *cbuild
 		res.Done()
 	}
 	return resp, dfmap, retErr
+}
+
+func runTerminal(rdwr io.ReadWriter, conn dap.Conn) {
+	t := dap.NewTerminal(rdwr, "(buildx) ")
+	if err := t.Run(context.Background(), conn); err != nil && !errors.Is(err, io.EOF) {
+		fmt.Fprintf(rdwr, "fatal error: %s\n", err)
+	}
 }
 
 func runInvokeBuild(ctx context.Context, dockerCli command.Cli, opts *cbuild.Options, options buildOptions, printer *progress.Printer) (resp *client.SolveResponse, inputs *build.Inputs, retErr error) {
@@ -1151,12 +1161,7 @@ func otelErrorType(err error) string {
 	return name
 }
 
-type ioConn struct{}
-
-func (c *ioConn) Read(p []byte) (int, error) {
-	return os.Stdin.Read(p)
-}
-
-func (c *ioConn) Write(p []byte) (int, error) {
-	return os.Stdout.Write(p)
+type readWriter struct {
+	io.Reader
+	io.Writer
 }
