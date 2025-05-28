@@ -2,14 +2,18 @@ package debug
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 
 	"github.com/docker/buildx/build"
 	"github.com/google/go-dap"
 	"github.com/google/shlex"
+	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	gateway "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/solver/errdefs"
+	"github.com/moby/buildkit/solver/pb"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 )
@@ -176,7 +180,7 @@ func (d *Adapter) launch(c Context) {
 			started := c.Go(func(c Context) {
 				defer d.deleteThread(c, t)
 				defer close(req.errCh)
-				req.errCh <- d.evaluate(c, t, req.c, req.res)
+				req.errCh <- t.Evaluate(c, req.c, req.res)
 			})
 
 			if !started {
@@ -227,34 +231,6 @@ type evaluateRequest struct {
 	c     gateway.Client
 	res   *gateway.Result
 	errCh chan<- error
-}
-
-func (d *Adapter) evaluate(ctx Context, t *thread, c gateway.Client, res *gateway.Result) error {
-	return res.EachRef(func(ref gateway.Reference) error {
-		if err := ref.Evaluate(ctx); err != nil && d.cfg.SuspendOn.OnError() {
-			var solveErr errdefs.SolveError
-			if errors.As(err, &solveErr) {
-				paused := t.Pause(ctx, "exception", "Encountered an error during build")
-				select {
-				case <-paused:
-					return err
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-			}
-			return err
-		}
-
-		if d.cfg.SuspendOn == SuspendAlways {
-			paused := t.Pause(ctx, "pause", "Result built")
-			select {
-			case <-paused:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-		return nil
-	})
 }
 
 func (d *Adapter) EvaluateResult(ctx context.Context, c gateway.Client, res *gateway.Result) error {
@@ -336,7 +312,7 @@ type thread struct {
 	name string
 
 	paused chan struct{}
-	ref    gateway.Reference
+	req    *containerRequest
 	mu     sync.Mutex
 }
 
@@ -345,7 +321,11 @@ func (t *thread) Evaluate(ctx Context, c gateway.Client, res *gateway.Result) er
 		if err := ref.Evaluate(ctx); err != nil && t.d.cfg.SuspendOn.OnError() {
 			var solveErr errdefs.SolveError
 			if errors.As(err, &solveErr) {
-				paused := t.Pause(ctx, "exception", "Encountered an error during build")
+				paused, err := t.containerConfigFromError(ctx, &solveErr)
+				if err != nil {
+					return err
+				}
+
 				select {
 				case <-paused:
 					return err
@@ -357,7 +337,10 @@ func (t *thread) Evaluate(ctx Context, c gateway.Client, res *gateway.Result) er
 		}
 
 		if t.d.cfg.SuspendOn == SuspendAlways {
-			paused := t.Pause(ctx, "pause", "Result built")
+			paused, err := t.containerConfigFromResult(ctx, res)
+			if err != nil {
+				return err
+			}
 			select {
 			case <-paused:
 			case <-ctx.Done():
@@ -368,7 +351,115 @@ func (t *thread) Evaluate(ctx Context, c gateway.Client, res *gateway.Result) er
 	})
 }
 
-func (t *thread) Pause(c Context, reason, desc string) <-chan struct{} {
+func (t *thread) containerConfigFromResult(c Context, res *gateway.Result) (<-chan struct{}, error) {
+	ps, err := exptypes.ParsePlatforms(res.Metadata)
+	if err != nil {
+		return nil, err
+	}
+
+	ref, ok := res.FindRef(ps.Platforms[0].ID)
+	if !ok {
+		return nil, errors.Errorf("no reference found")
+	}
+
+	req := containerRequest{
+		NewContainer: gateway.NewContainerRequest{
+			Mounts: []gateway.Mount{
+				{
+					Dest:      "/",
+					MountType: pb.MountType_BIND,
+					Ref:       ref,
+				},
+			},
+		},
+	}
+
+	imgData := res.Metadata[exptypes.ExporterImageConfigKey]
+	var img *ocispecs.Image
+	if len(imgData) > 0 {
+		img = &ocispecs.Image{}
+		if err := json.Unmarshal(imgData, img); err != nil {
+			return nil, err
+		}
+	}
+
+	if img != nil {
+		req.Start.User = img.Config.User
+		req.Start.Cwd = img.Config.WorkingDir
+		req.Start.Env = img.Config.Env
+
+		req.Start.Args = append([]string{}, img.Config.Entrypoint...)
+		// Store the command separately so we can add it before
+		// executing the container.
+		req.Cmd = append([]string{}, img.Config.Cmd...)
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Store our request.
+	t.req = &req
+
+	paused := t.pause(c, "pause", "Result built")
+	return paused, nil
+}
+
+func (t *thread) containerConfigFromError(c Context, solveErr *errdefs.SolveError) (<-chan struct{}, error) {
+	exec, err := execOpFromError(solveErr)
+	if err != nil {
+		return nil, err
+	}
+
+	var mounts []gateway.Mount
+	for i, mnt := range exec.Mounts {
+		rid := solveErr.MountIDs[i]
+		mounts = append(mounts, gateway.Mount{
+			Selector:  mnt.Selector,
+			Dest:      mnt.Dest,
+			ResultID:  rid,
+			Readonly:  mnt.Readonly,
+			MountType: mnt.MountType,
+			CacheOpt:  mnt.CacheOpt,
+			SecretOpt: mnt.SecretOpt,
+			SSHOpt:    mnt.SSHOpt,
+		})
+	}
+
+	req := containerRequest{
+		NewContainer: gateway.NewContainerRequest{
+			Mounts:  mounts,
+			NetMode: exec.Network,
+		},
+	}
+
+	req.Start.User = exec.Meta.User
+	req.Start.Cwd = exec.Meta.Cwd
+	req.Start.Env = exec.Meta.Env
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Store our request.
+	t.req = &req
+
+	paused := t.pause(c, "exception", "Encountered an error during build")
+	return paused, nil
+}
+
+func execOpFromError(solveErr *errdefs.SolveError) (*pb.ExecOp, error) {
+	if solveErr == nil {
+		return nil, errors.Errorf("no error is available")
+	}
+	switch op := solveErr.Op.GetOp().(type) {
+	case *pb.Op_Exec:
+		return op.Exec, nil
+	default:
+		return nil, errors.Errorf("invoke: unsupported error type")
+	}
+	// TODO: support other ops
+}
+
+func (t *thread) pause(c Context, reason, desc string) <-chan struct{} {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -397,4 +488,37 @@ func (t *thread) Resume(c Context) {
 
 	close(t.paused)
 	t.paused = nil
+}
+
+func (t *thread) Exec(ctx Context, c gateway.Client, args []string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.paused == nil {
+		return errors.Errorf("thread %d cannot spawn a process since it is not paused", t.id)
+	}
+
+	if t.req == nil {
+		return errors.Errorf("thread %d cannot spawn a process because there is no container to execute", t.id)
+	}
+
+	req := *t.req
+
+	ctr, err := c.NewContainer(ctx, req.NewContainer)
+	if err != nil {
+		return err
+	}
+
+	if len(args) > 0 {
+		req.Start.Args = append(req.Start.Args, args...)
+	} else if len(req.Cmd) > 0 {
+		req.Start.Args = append(req.Start.Args, req.Cmd...)
+	}
+	return nil
+}
+
+type containerRequest struct {
+	NewContainer gateway.NewContainerRequest
+	Start        gateway.StartRequest
+	Cmd          []string
 }
