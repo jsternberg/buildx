@@ -31,8 +31,9 @@ type Terminal struct {
 
 	client *Client
 
-	paused   chan struct{}
-	pausedMu sync.Mutex
+	paused       chan struct{}
+	pausedMu     sync.Mutex
+	resumeThread int
 }
 
 func NewTerminal(dockerCli command.Cli, prompt string, printer *progress.Printer) *Terminal {
@@ -54,7 +55,7 @@ func (t *Terminal) Run(ctx context.Context, conn Conn) error {
 			// Wait for the initialized event and send configuration done.
 			// We don't perform any additional configuration.
 			select {
-			case res := <-client.Do(&dap.ConfigurationDoneRequest{}):
+			case res := <-t.client.Do(&dap.ConfigurationDoneRequest{}):
 				if !res.GetResponse().Success {
 					return errors.New(res.GetResponse().Message)
 				}
@@ -66,12 +67,15 @@ func (t *Terminal) Run(ctx context.Context, conn Conn) error {
 	})
 
 	t.paused = make(chan struct{})
-	t.client.RegisterEvent("stopped", func(_ dap.EventMessage) {
+	t.client.RegisterEvent("stopped", func(m dap.EventMessage) {
+		e := m.(*dap.StoppedEvent)
+
 		t.pausedMu.Lock()
 		if t.paused != nil {
 			close(t.paused)
 		}
 		t.paused = nil
+		t.resumeThread = e.Body.ThreadId
 		t.pausedMu.Unlock()
 	})
 
@@ -166,8 +170,12 @@ func (t *Terminal) repl(ctx context.Context) error {
 
 		select {
 		case l := <-lineCh:
-			if resume, err := t.invoke(ctx, t.dockerCli.Out(), l); resume || err != nil {
+			if resume, err := t.invoke(ctx, t.dockerCli.Out(), l); err != nil {
 				return err
+			} else if resume {
+				t.pausedMu.Lock()
+				t.paused = make(chan struct{})
+				t.pausedMu.Unlock()
 			}
 		case err := <-errCh:
 			return err
@@ -192,6 +200,8 @@ func (t *Terminal) invoke(ctx context.Context, out io.Writer, l string) (resume 
 		// nop
 		return
 	case "continue":
+		t.continue_()
+		return true, nil
 	case "exit":
 		return true, io.EOF
 	case "help":
@@ -215,6 +225,19 @@ func (t *Terminal) invoke(ctx context.Context, out io.Writer, l string) (resume 
 		t.printHelpMessage(out)
 	}
 	return
+}
+
+func (t *Terminal) continue_() {
+	t.pausedMu.Lock()
+	tid := t.resumeThread
+	t.resumeThread = 0
+	t.pausedMu.Unlock()
+
+	<-t.client.Do(&dap.ContinueRequest{
+		Arguments: dap.ContinueArguments{
+			ThreadId: tid,
+		},
+	})
 }
 
 func (t *Terminal) printHelpMessageOfCommand(out io.Writer, name string) {
