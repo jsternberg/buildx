@@ -116,6 +116,8 @@ func (s *Server) handleMessage(c Context, m dap.Message) (dap.ResponseMessage, e
 		return s.h.ConfigurationDone.Do(c, req)
 	case *dap.ThreadsRequest:
 		return s.h.Threads.Do(c, req)
+	case *dap.EvaluateRequest:
+		return s.h.Evaluate.Do(c, req)
 	default:
 		return nil, errors.New("not implemented")
 	}

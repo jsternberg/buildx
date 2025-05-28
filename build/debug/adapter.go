@@ -7,6 +7,7 @@ import (
 
 	"github.com/docker/buildx/build"
 	"github.com/google/go-dap"
+	"github.com/google/shlex"
 	gateway "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/solver/errdefs"
 	"github.com/pkg/errors"
@@ -128,6 +129,24 @@ func (d *Adapter) ConfigurationDone(c Context, req *dap.ConfigurationDoneRequest
 	return nil
 }
 
+func (d *Adapter) Evaluate(c Context, req *dap.EvaluateRequest, resp *dap.EvaluateResponse) error {
+	if req.Arguments.Context != "repl" {
+		return errors.New("unsupported context")
+	}
+
+	args, err := shlex.Split(req.Arguments.Expression)
+	if err != nil {
+		return err
+	} else if len(args) == 0 {
+		return nil
+	}
+
+	switch arg0 := args[0]; arg0 {
+	case "exec":
+	}
+	return nil
+}
+
 func (d *Adapter) launch(c Context) {
 	// Send initialized event.
 	c.C() <- &dap.InitializedEvent{
@@ -172,6 +191,7 @@ func (d *Adapter) newThread(ctx Context) (t *thread) {
 	d.threadsMu.Lock()
 	id := d.nextThreadID
 	t = &thread{
+		d:    d,
 		id:   id,
 		name: fmt.Sprintf("thread%d", id),
 	}
@@ -237,7 +257,7 @@ func (d *Adapter) evaluate(ctx Context, t *thread, c gateway.Client, res *gatewa
 	})
 }
 
-func (d *Adapter) Evaluate(ctx context.Context, c gateway.Client, res *gateway.Result) error {
+func (d *Adapter) EvaluateResult(ctx context.Context, c gateway.Client, res *gateway.Result) error {
 	errCh := make(chan error, 1)
 
 	// Send a solve request to the launch routine
@@ -282,7 +302,7 @@ func (d *Adapter) Handler() build.Handler {
 
 			started := d.srv.Go(func(ctx Context) {
 				defer close(errCh)
-				errCh <- d.Evaluate(ctx, c, res)
+				errCh <- d.EvaluateResult(ctx, c, res)
 			})
 			if !started {
 				return context.Canceled
@@ -311,12 +331,41 @@ func (d *Adapter) dapHandler() Handler {
 }
 
 type thread struct {
+	d    *Adapter
 	id   int
 	name string
 
 	paused chan struct{}
 	ref    gateway.Reference
 	mu     sync.Mutex
+}
+
+func (t *thread) Evaluate(ctx Context, c gateway.Client, res *gateway.Result) error {
+	return res.EachRef(func(ref gateway.Reference) error {
+		if err := ref.Evaluate(ctx); err != nil && t.d.cfg.SuspendOn.OnError() {
+			var solveErr errdefs.SolveError
+			if errors.As(err, &solveErr) {
+				paused := t.Pause(ctx, "exception", "Encountered an error during build")
+				select {
+				case <-paused:
+					return err
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			return err
+		}
+
+		if t.d.cfg.SuspendOn == SuspendAlways {
+			paused := t.Pause(ctx, "pause", "Result built")
+			select {
+			case <-paused:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	})
 }
 
 func (t *thread) Pause(c Context, reason, desc string) <-chan struct{} {

@@ -53,4 +53,5 @@ type Handler struct {
 	SetBreakpoints    HandlerFunc[*dap.SetBreakpointsRequest, *dap.SetBreakpointsResponse]
 	ConfigurationDone HandlerFunc[*dap.ConfigurationDoneRequest, *dap.ConfigurationDoneResponse]
 	Threads           HandlerFunc[*dap.ThreadsRequest, *dap.ThreadsResponse]
+	Evaluate          HandlerFunc[*dap.EvaluateRequest, *dap.EvaluateResponse]
 }
