@@ -29,6 +29,8 @@ type Terminal struct {
 	printer            *progress.Printer
 	registeredCommands map[string]types.Command
 
+	client *Client
+
 	paused   chan struct{}
 	pausedMu sync.Mutex
 }
@@ -42,12 +44,12 @@ func NewTerminal(dockerCli command.Cli, prompt string, printer *progress.Printer
 }
 
 func (t *Terminal) Run(ctx context.Context, conn Conn) error {
-	client := NewClient(conn)
-	defer client.Close()
+	t.client = NewClient(conn)
+	defer t.client.Close()
 
 	eg, _ := errgroup.WithContext(ctx)
 
-	client.RegisterEvent("initialized", func(_ dap.EventMessage) {
+	t.client.RegisterEvent("initialized", func(_ dap.EventMessage) {
 		eg.Go(func() error {
 			// Wait for the initialized event and send configuration done.
 			// We don't perform any additional configuration.
@@ -64,7 +66,7 @@ func (t *Terminal) Run(ctx context.Context, conn Conn) error {
 	})
 
 	t.paused = make(chan struct{})
-	client.RegisterEvent("stopped", func(_ dap.EventMessage) {
+	t.client.RegisterEvent("stopped", func(_ dap.EventMessage) {
 		t.pausedMu.Lock()
 		if t.paused != nil {
 			close(t.paused)
@@ -73,7 +75,7 @@ func (t *Terminal) Run(ctx context.Context, conn Conn) error {
 		t.pausedMu.Unlock()
 	})
 
-	resCh := client.Do(&dap.InitializeRequest{})
+	resCh := t.client.Do(&dap.InitializeRequest{})
 	select {
 	case res := <-resCh:
 		if !res.GetResponse().Success {
@@ -83,7 +85,7 @@ func (t *Terminal) Run(ctx context.Context, conn Conn) error {
 		return ctx.Err()
 	}
 
-	resCh = client.Do(&dap.LaunchRequest{})
+	resCh = t.client.Do(&dap.LaunchRequest{})
 	select {
 	case res := <-resCh:
 		if !res.GetResponse().Success {
@@ -189,6 +191,7 @@ func (t *Terminal) invoke(ctx context.Context, out io.Writer, l string) (resume 
 	case "":
 		// nop
 		return
+	case "continue":
 	case "exit":
 		return true, io.EOF
 	case "help":
