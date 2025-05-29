@@ -21,7 +21,7 @@ import (
 	"github.com/docker/buildx/build"
 	dap "github.com/docker/buildx/build/debug"
 	"github.com/docker/buildx/builder"
-	"github.com/docker/buildx/commands/debug"
+	debugcmd "github.com/docker/buildx/commands/debug"
 	cbuild "github.com/docker/buildx/controller/build"
 	"github.com/docker/buildx/controller/control"
 	controllerapi "github.com/docker/buildx/controller/pb"
@@ -103,7 +103,6 @@ type buildOptions struct {
 	exportLoad   bool
 
 	invokeConfig *invokeConfig
-	dapConfig    *dapConfig
 }
 
 func (o *buildOptions) toControllerOptions() (*cbuild.Options, error) {
@@ -411,38 +410,40 @@ func getImageID(resp map[string]string) string {
 }
 
 func runControllerBuild(ctx context.Context, dockerCli command.Cli, opts *cbuild.Options, options buildOptions, printer *progress.Printer) (*client.SolveResponse, *build.Inputs, error) {
-	var h build.Handler
+	var (
+		h  build.Handler
+		in io.Reader
+	)
+
 	if confutil.IsExperimental() && options.invokeConfig != nil {
-		if in := dockerCli.In(); in.IsTerminal() {
-			cfg := dap.Config{}
-			switch options.invokeConfig.onFlag {
-			case "error":
-				cfg.SuspendOn = dap.SuspendError
-			case "always":
-				cfg.SuspendOn = dap.SuspendAlways
-			case "never":
-				cfg.SuspendOn = dap.SuspendNever
-			default:
-				fmt.Fprintf(dockerCli.Err(), "Error: --on=%s not recognized, using --on=error as the default.\n", options.invokeConfig.onFlag)
-			}
-
-			adapter := dap.NewAdapter(cfg)
-			c1, c2 := dap.Pipe()
-
-			go runTerminal(dockerCli, c2, printer)
-
-			adapter.Start(ctx, c1)
-			defer adapter.Stop()
-			h = adapter.Handler()
+		if options.dockerfileName == "-" || options.contextPath == "-" {
+			// stdin must be usable for the monitor
+			return nil, nil, errors.Errorf("Dockerfile or context from stdin is not supported with invoke")
 		}
+
+		adapter := dap.NewAdapter()
+		defer adapter.Stop()
+
+		go runTerminal(dockerCli, adapter, printer)
+
+		h = adapter.Handler()
+	} else {
+		in = dockerCli.In()
 	}
 
-	return cbuild.RunBuild(ctx, dockerCli, opts, dockerCli.In(), printer, h, false)
+	for {
+		res, inputs, err := cbuild.RunBuild(ctx, dockerCli, opts, in, printer, h, false)
+		if err != nil && errors.Is(err, dap.ErrRestart) {
+			// Ignore the error and restart the build.
+			continue
+		}
+		return res, inputs, err
+	}
 }
 
-func runTerminal(dockerCli command.Cli, conn dap.Conn, printer *progress.Printer) {
+func runTerminal(dockerCli command.Cli, adapter *dap.Adapter, printer *progress.Printer) {
 	t := dap.NewTerminal(dockerCli, "(buildx) ", printer)
-	if err := t.Run(context.Background(), conn); err != nil && !errors.Is(err, io.EOF) {
+	if err := t.Run(context.Background(), adapter); err != nil && !errors.Is(err, io.EOF) {
 		fmt.Fprintf(dockerCli.Err(), "fatal error: %s\n", err)
 	}
 }
@@ -462,7 +463,7 @@ func printError(err error, printer *progress.Printer) error {
 	return nil
 }
 
-func newDebuggableBuild(dockerCli command.Cli, rootOpts *rootOptions) debug.DebuggableCmd {
+func newDebuggableBuild(dockerCli command.Cli, rootOpts *rootOptions) debugcmd.DebuggableCmd {
 	return &debuggableBuild{dockerCli: dockerCli, rootOpts: rootOpts}
 }
 
@@ -471,11 +472,11 @@ type debuggableBuild struct {
 	rootOpts  *rootOptions
 }
 
-func (b *debuggableBuild) NewDebugger(cfg *debug.DebugConfig) *cobra.Command {
+func (b *debuggableBuild) NewDebugger(cfg *debugcmd.DebugConfig) *cobra.Command {
 	return buildCmd(b.dockerCli, b.rootOpts, cfg)
 }
 
-func buildCmd(dockerCli command.Cli, rootOpts *rootOptions, debugConfig *debug.DebugConfig) *cobra.Command {
+func buildCmd(dockerCli command.Cli, rootOpts *rootOptions, debugConfig *debugcmd.DebugConfig) *cobra.Command {
 	cFlags := &commonFlags{}
 	options := &buildOptions{}
 
@@ -503,7 +504,6 @@ func buildCmd(dockerCli command.Cli, rootOpts *rootOptions, debugConfig *debug.D
 			cmd.Flags().VisitAll(checkWarnedFlags)
 
 			if debugConfig != nil {
-				options.dapConfig = new(dapConfig)
 				if debugConfig.InvokeFlag != "" || debugConfig.OnFlag != "" {
 					iConfig := new(invokeConfig)
 					if err := iConfig.parseInvokeConfig(debugConfig.InvokeFlag, debugConfig.OnFlag); err != nil {

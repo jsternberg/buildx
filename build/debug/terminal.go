@@ -5,16 +5,14 @@ import (
 	"fmt"
 	"io"
 	"sort"
-	"sync"
 	"text/tabwriter"
 
 	"github.com/docker/buildx/monitor/types"
+	"github.com/docker/buildx/util/ioset"
 	"github.com/docker/buildx/util/progress"
 	"github.com/docker/cli/cli/command"
 	"github.com/google/go-dap"
 	"github.com/google/shlex"
-	"github.com/pkg/errors"
-	"golang.org/x/sync/errgroup"
 	"golang.org/x/term"
 )
 
@@ -29,11 +27,11 @@ type Terminal struct {
 	printer            *progress.Printer
 	registeredCommands map[string]types.Command
 
-	client *Client
+	muxIO *ioset.MuxIO
 
-	paused       chan struct{}
-	pausedMu     sync.Mutex
-	resumeThread int
+	// paused       chan struct{}
+	// pausedMu     sync.Mutex
+	// resumeThread int
 }
 
 func NewTerminal(dockerCli command.Cli, prompt string, printer *progress.Printer) *Terminal {
@@ -44,66 +42,28 @@ func NewTerminal(dockerCli command.Cli, prompt string, printer *progress.Printer
 	}
 }
 
-func (t *Terminal) Run(ctx context.Context, conn Conn) error {
-	t.client = NewClient(conn)
-	defer t.client.Close()
+func (t *Terminal) Run(ctx context.Context, adapter *Adapter) error {
+	// eg, _ := errgroup.WithContext(ctx)
 
-	eg, _ := errgroup.WithContext(ctx)
-
-	t.client.RegisterEvent("initialized", func(_ dap.EventMessage) {
-		eg.Go(func() error {
-			// Wait for the initialized event and send configuration done.
-			// We don't perform any additional configuration.
-			select {
-			case res := <-t.client.Do(&dap.ConfigurationDoneRequest{}):
-				if !res.GetResponse().Success {
-					return errors.New(res.GetResponse().Message)
-				}
-				return nil
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		})
-	})
-
-	t.paused = make(chan struct{})
-	t.client.RegisterEvent("stopped", func(m dap.EventMessage) {
-		e := m.(*dap.StoppedEvent)
-
-		t.pausedMu.Lock()
-		if t.paused != nil {
-			close(t.paused)
-		}
-		t.paused = nil
-		t.resumeThread = e.Body.ThreadId
-		t.pausedMu.Unlock()
-	})
-
-	resCh := t.client.Do(&dap.InitializeRequest{})
-	select {
-	case res := <-resCh:
-		if !res.GetResponse().Success {
-			return errors.New(res.GetResponse().Message)
-		}
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
-	resCh = t.client.Do(&dap.LaunchRequest{})
-	select {
-	case res := <-resCh:
-		if !res.GetResponse().Success {
-			return errors.New(res.GetResponse().Message)
-		}
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
-	eg.Go(func() error {
-		return t.run(ctx)
-	})
-
-	return eg.Wait()
+	// t.paused = make(chan struct{})
+	// t.client.RegisterEvent("stopped", func(m dap.EventMessage) {
+	// 	e := m.(*dap.StoppedEvent)
+	//
+	// 	t.pausedMu.Lock()
+	// 	if t.paused != nil {
+	// 		close(t.paused)
+	// 	}
+	// 	t.paused = nil
+	// 	t.resumeThread = e.Body.ThreadId
+	// 	t.pausedMu.Unlock()
+	// })
+	//
+	// eg.Go(func() error {
+	// 	return t.run(ctx)
+	// })
+	//
+	// return eg.Wait()
+	return nil
 }
 
 func (t *Terminal) run(ctx context.Context) error {
