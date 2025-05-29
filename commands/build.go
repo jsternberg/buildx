@@ -32,6 +32,7 @@ import (
 	"github.com/docker/buildx/util/cobrautil"
 	"github.com/docker/buildx/util/confutil"
 	"github.com/docker/buildx/util/desktop"
+	"github.com/docker/buildx/util/ioset"
 	"github.com/docker/buildx/util/metricutil"
 	"github.com/docker/buildx/util/osutil"
 	"github.com/docker/buildx/util/progress"
@@ -424,7 +425,7 @@ func runControllerBuild(ctx context.Context, dockerCli command.Cli, opts *cbuild
 		adapter := dap.NewAdapter()
 		defer adapter.Stop()
 
-		go runTerminal(dockerCli, adapter, printer)
+		go runConsole(dockerCli, adapter, printer)
 
 		h = adapter.Handler()
 	} else {
@@ -441,8 +442,16 @@ func runControllerBuild(ctx context.Context, dockerCli command.Cli, opts *cbuild
 	}
 }
 
-func runTerminal(dockerCli command.Cli, adapter *dap.Adapter, printer *progress.Printer) {
-	t := dap.NewTerminal(dockerCli, "(buildx) ", printer)
+func runConsole(dockerCli command.Cli, adapter *dap.Adapter, printer *progress.Printer) {
+	c := dap.NewConsole(dockerCli, "(buildx) ", printer)
+
+	c.Attach(ioset.In{
+		Stdin:  io.NopCloser(dockerCli.In()),
+		Stdout: nopCloser{dockerCli.Out()},
+		Stderr: nopCloser{dockerCli.Err()},
+	})
+	defer c.Detach()
+
 	if err := t.Run(context.Background(), adapter); err != nil && !errors.Is(err, io.EOF) {
 		fmt.Fprintf(dockerCli.Err(), "fatal error: %s\n", err)
 	}
@@ -1074,3 +1083,9 @@ func otelErrorType(err error) string {
 	}
 	return name
 }
+
+type nopCloser struct {
+	io.Writer
+}
+
+func (c nopCloser) Close() error { return nil }

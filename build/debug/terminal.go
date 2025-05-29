@@ -21,28 +21,72 @@ var additionalHelpMessages = map[string]string{
 	"exit": "exits monitor",
 }
 
-type Terminal struct {
+type Console struct {
 	dockerCli          command.Cli
 	prompt             string
 	printer            *progress.Printer
 	registeredCommands map[string]types.Command
 
-	muxIO *ioset.MuxIO
-
+	muxIO       *ioset.MuxIO
+	invokeIO    *ioset.Forwarder
+	monitorIn   *ioset.In
+	containerIn *ioset.In
 	// paused       chan struct{}
 	// pausedMu     sync.Mutex
 	// resumeThread int
 }
 
-func NewTerminal(dockerCli command.Cli, prompt string, printer *progress.Printer) *Terminal {
-	return &Terminal{
+func NewConsole(dockerCli command.Cli, prompt string, printer *progress.Printer) *Console {
+	return &Console{
 		dockerCli: dockerCli,
 		prompt:    prompt,
 		printer:   printer,
 	}
 }
 
-func (t *Terminal) Run(ctx context.Context, adapter *Adapter) error {
+func (c *Console) Attach(in ioset.In) {
+	monitorIn, monitorOut := ioset.Pipe()
+	monitorEnableCh := make(chan struct{})
+	monitorDisableCh := make(chan struct{})
+	monitorOutCtx := ioset.MuxOut{
+		Out:         monitorOut,
+		EnableHook:  func() { monitorEnableCh <- struct{}{} },
+		DisableHook: func() { monitorDisableCh <- struct{}{} },
+	}
+	c.monitorIn = &monitorIn
+
+	containerIn, containerOut := ioset.Pipe()
+	containerOutCtx := ioset.MuxOut{
+		Out: containerOut,
+		// send newline to hopefully get the prompt; TODO: better UI (e.g. reprinting the last line)
+		EnableHook:  func() { containerOut.Stdin.Write([]byte("\n")) },
+		DisableHook: func() {},
+	}
+	c.containerIn = &containerIn
+
+	c.invokeIO = ioset.NewForwarder()
+	c.invokeIO.SetIn(&containerIn)
+	c.muxIO = ioset.NewMuxIO(in, []ioset.MuxOut{monitorOutCtx, containerOutCtx}, 1, func(prev int, res int) string {
+		if prev == 0 && res == 0 {
+			// No toggle happened because container I/O isn't enabled.
+			return "Process isn't attached (previous \"exec\" exited?). Use \"attach\" for attaching or \"rollback\" or \"exec\" for running new one.\n"
+		}
+		return "Switched IO\n"
+	})
+}
+
+func (c *Console) Detach() {
+	if c.monitorIn != nil {
+		c.monitorIn.Close()
+		c.monitorIn = nil
+	}
+	if c.containerIn != nil {
+		c.containerIn.Close()
+		c.containerIn = nil
+	}
+}
+
+func (t *Console) Run(ctx context.Context, adapter *Adapter) error {
 	// eg, _ := errgroup.WithContext(ctx)
 
 	// t.paused = make(chan struct{})
@@ -66,7 +110,9 @@ func (t *Terminal) Run(ctx context.Context, adapter *Adapter) error {
 	return nil
 }
 
-func (t *Terminal) run(ctx context.Context) error {
+func (t *Console) setupInput()
+
+func (t *Console) run(ctx context.Context) error {
 	for {
 		var paused <-chan struct{}
 
@@ -88,7 +134,7 @@ func (t *Terminal) run(ctx context.Context) error {
 	}
 }
 
-func (t *Terminal) repl(ctx context.Context) error {
+func (t *Console) repl(ctx context.Context) error {
 	if err := t.printer.Pause(); err != nil {
 		return err
 	}
@@ -145,7 +191,7 @@ func (t *Terminal) repl(ctx context.Context) error {
 	}
 }
 
-func (t *Terminal) invoke(ctx context.Context, out io.Writer, l string) (resume bool, err error) {
+func (t *Console) invoke(ctx context.Context, out io.Writer, l string) (resume bool, err error) {
 	args, err := shlex.Split(l)
 	if err != nil {
 		fmt.Fprintf(out, "monitor: failed to parse command: %v\n", err)
@@ -187,7 +233,7 @@ func (t *Terminal) invoke(ctx context.Context, out io.Writer, l string) (resume 
 	return
 }
 
-func (t *Terminal) continue_() {
+func (t *Console) continue_() {
 	t.pausedMu.Lock()
 	tid := t.resumeThread
 	t.resumeThread = 0
@@ -200,7 +246,7 @@ func (t *Terminal) continue_() {
 	})
 }
 
-func (t *Terminal) printHelpMessageOfCommand(out io.Writer, name string) {
+func (t *Console) printHelpMessageOfCommand(out io.Writer, name string) {
 	var target types.Command
 	if c, ok := t.registeredCommands[name]; ok {
 		target = c
@@ -215,7 +261,7 @@ func (t *Terminal) printHelpMessageOfCommand(out io.Writer, name string) {
 	}
 }
 
-func (t *Terminal) printHelpMessage(out io.Writer) {
+func (t *Console) printHelpMessage(out io.Writer) {
 	var names []string
 	for name := range t.registeredCommands {
 		names = append(names, name)
