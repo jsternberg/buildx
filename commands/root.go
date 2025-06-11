@@ -120,9 +120,10 @@ func addCommands(cmd *cobra.Command, opts *rootOptions, dockerCli command.Cli) {
 		historycmd.RootCmd(cmd, dockerCli, historycmd.RootOptions{Builder: &opts.builder}),
 	)
 	if confutil.IsExperimental() {
-		cmd.AddCommand(debugcmd.RootCmd(dockerCli,
+		children := []debugcmd.DebuggableCmd{
 			newDebuggableBuild(dockerCli, opts),
-		))
+		}
+		debugcmd.AddCommands(cmd, dockerCli, children...)
 	}
 
 	cmd.RegisterFlagCompletionFunc( //nolint:errcheck

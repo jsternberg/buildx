@@ -56,7 +56,7 @@ func (m *Monitor) Handler() build.Handler {
 	}
 }
 
-func (m *Monitor) Evaluate(ctx context.Context, c gateway.Client, res *gateway.Result) error {
+func (m *Monitor) Evaluate(ctx context.Context, _ string, c gateway.Client, res *gateway.Result) error {
 	buildErr := res.EachRef(func(ref gateway.Reference) error {
 		return ref.Evaluate(ctx)
 	})
