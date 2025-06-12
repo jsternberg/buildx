@@ -1,8 +1,10 @@
 package debug
 
 import (
+	"github.com/containerd/console"
 	"github.com/docker/buildx/build"
 	"github.com/docker/buildx/util/cobrautil"
+	"github.com/docker/buildx/util/ioset"
 	"github.com/docker/buildx/util/progress"
 	"github.com/docker/cli/cli/command"
 	"github.com/spf13/cobra"
@@ -16,13 +18,19 @@ type DebuggableCmd interface {
 
 // Debugger will start a debugger instance.
 type Debugger interface {
-	Start(dockerCli command.Cli, printer *progress.Printer) (DebuggerInstance, error)
+	New(in ioset.In) (DebuggerInstance, error)
 }
 
 // DebuggerInstance is an instance of a Debugger that has been started.
 type DebuggerInstance interface {
+	Start(printer *progress.Printer) error
 	Handler() build.Handler
 	Stop() error
+
+	// TODO: This probably could just return an io.Writer, but
+	// the NewPrinter function takes in a console.File. That could probably
+	// be changed and this would work better.
+	Out() console.File
 }
 
 func AddCommands(rootCmd *cobra.Command, dockerCli command.Cli, children ...DebuggableCmd) {

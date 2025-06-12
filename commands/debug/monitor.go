@@ -2,14 +2,16 @@ package debug
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"strconv"
 	"strings"
 
+	"github.com/containerd/console"
 	"github.com/docker/buildx/build"
 	"github.com/docker/buildx/monitor"
+	"github.com/docker/buildx/util/ioset"
 	"github.com/docker/buildx/util/progress"
-	"github.com/docker/cli/cli/command"
 	"github.com/pkg/errors"
 	"github.com/tonistiigi/go-csvvalue"
 )
@@ -22,18 +24,28 @@ type MonitorDebugger struct {
 	OnFlag string
 }
 
-func (d *MonitorDebugger) Start(dockerCli command.Cli, printer *progress.Printer) (DebuggerInstance, error) {
+func (d *MonitorDebugger) New(in ioset.In) (DebuggerInstance, error) {
 	cfg, err := parseInvokeConfig(d.InvokeFlag, d.OnFlag)
 	if err != nil {
 		return nil, err
 	}
 
-	m := monitor.New(cfg, dockerCli.In(), os.Stdout, os.Stderr, printer)
-	return &monitorDebuggerInstance{m: m}, nil
+	return &monitorDebuggerInstance{
+		cfg: cfg,
+		in:  in.Stdin,
+	}, nil
 }
 
 type monitorDebuggerInstance struct {
+	cfg *build.InvokeConfig
+	in  io.ReadCloser
+
 	m *monitor.Monitor
+}
+
+func (d *monitorDebuggerInstance) Start(printer *progress.Printer) error {
+	d.m = monitor.New(d.cfg, d.in, os.Stdout, os.Stderr, printer)
+	return nil
 }
 
 func (d *monitorDebuggerInstance) Handler() build.Handler {
@@ -42,6 +54,10 @@ func (d *monitorDebuggerInstance) Handler() build.Handler {
 
 func (d *monitorDebuggerInstance) Stop() error {
 	return d.m.Close()
+}
+
+func (d *monitorDebuggerInstance) Out() console.File {
+	return os.Stderr
 }
 
 func parseInvokeConfig(invoke, on string) (*build.InvokeConfig, error) {

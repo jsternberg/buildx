@@ -28,6 +28,7 @@ import (
 	"github.com/docker/buildx/util/confutil"
 	"github.com/docker/buildx/util/desktop"
 	"github.com/docker/buildx/util/dockerutil"
+	"github.com/docker/buildx/util/ioset"
 	"github.com/docker/buildx/util/metricutil"
 	"github.com/docker/buildx/util/osutil"
 	"github.com/docker/buildx/util/platformutil"
@@ -319,10 +320,6 @@ func runBuild(ctx context.Context, dockerCli command.Cli, options buildOptions) 
 	}
 	driverType := b.Driver
 
-	var term bool
-	if _, err := console.ConsoleFromFile(os.Stderr); err == nil {
-		term = true
-	}
 	attributes := buildMetricAttributes(dockerCli, driverType, &options)
 
 	ctx2, cancel := context.WithCancelCause(context.TODO())
@@ -331,8 +328,31 @@ func runBuild(ctx context.Context, dockerCli command.Cli, options buildOptions) 
 	if err != nil {
 		return err
 	}
+
+	var (
+		out      console.File = os.Stderr
+		debugger debug.DebuggerInstance
+	)
+
+	if options.debugger != nil {
+		debugger, err = options.debugger.New(ioset.In{
+			Stdin:  io.NopCloser(dockerCli.In()),
+			Stdout: nopCloser{dockerCli.Out()},
+			Stderr: nopCloser{dockerCli.Err()},
+		})
+		if err != nil {
+			return err
+		}
+		out = debugger.Out()
+	}
+
+	var term bool
+	if _, err := console.ConsoleFromFile(out); err == nil {
+		term = true
+	}
+
 	var printer *progress.Printer
-	printer, err = progress.NewPrinter(ctx2, os.Stderr, progressMode,
+	printer, err = progress.NewPrinter(ctx2, out, progressMode,
 		progress.WithDesc(
 			fmt.Sprintf("building with %q instance using %s driver", b.Name, b.Driver),
 			fmt.Sprintf("%s:%s", b.Driver, b.Name),
@@ -347,7 +367,7 @@ func runBuild(ctx context.Context, dockerCli command.Cli, options buildOptions) 
 	}
 
 	done := timeBuildCommand(mp, attributes)
-	resp, inputs, retErr := runBuildWithOptions(ctx, dockerCli, opts, options, printer)
+	resp, inputs, retErr := runBuildWithOptions(ctx, dockerCli, opts, options, printer, debugger)
 
 	if err := printer.Wait(); retErr == nil {
 		retErr = err
@@ -405,22 +425,20 @@ func getImageID(resp map[string]string) string {
 	return dgst
 }
 
-func runBuildWithOptions(ctx context.Context, dockerCli command.Cli, opts *BuildOptions, options buildOptions, printer *progress.Printer) (_ *client.SolveResponse, _ *build.Inputs, retErr error) {
+func runBuildWithOptions(ctx context.Context, dockerCli command.Cli, opts *BuildOptions, options buildOptions, printer *progress.Printer, dbg debug.DebuggerInstance) (_ *client.SolveResponse, _ *build.Inputs, retErr error) {
 	var bh build.Handler
-	if options.debugger != nil {
+	if dbg != nil {
 		if options.dockerfileName == "-" || options.contextPath == "-" {
 			// stdin must be usable for debugger
 			return nil, nil, errors.Errorf("Dockerfile or context from stdin is not supported with debugger")
 		}
 
-		dbg, err := options.debugger.Start(dockerCli, printer)
-		if err != nil {
+		if err := dbg.Start(printer); err != nil {
 			return nil, nil, err
 		}
 		defer dbg.Stop()
 
 		bh = dbg.Handler()
-
 		dockerCli.SetIn(nil)
 	}
 
@@ -1125,4 +1143,12 @@ func RunBuild(ctx context.Context, dockerCli command.Cli, in *BuildOptions, inSt
 		inputs = &i.Inputs
 	}
 	return resp[defaultTargetName], inputs, nil
+}
+
+type nopCloser struct {
+	io.Writer
+}
+
+func (nopCloser) Close() error {
+	return nil
 }
