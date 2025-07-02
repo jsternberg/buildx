@@ -127,6 +127,8 @@ func (s *Server) handleMessage(c Context, m dap.Message) (dap.ResponseMessage, e
 		return s.h.StackTrace.Do(c, req)
 	case *dap.EvaluateRequest:
 		return s.h.Evaluate.Do(c, req)
+	case *dap.SourceRequest:
+		return s.h.Source.Do(c, req)
 	default:
 		return nil, errors.New("not implemented")
 	}

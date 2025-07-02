@@ -56,4 +56,5 @@ type Handler struct {
 	Threads           HandlerFunc[*dap.ThreadsRequest, *dap.ThreadsResponse]
 	StackTrace        HandlerFunc[*dap.StackTraceRequest, *dap.StackTraceResponse]
 	Evaluate          HandlerFunc[*dap.EvaluateRequest, *dap.EvaluateResponse]
+	Source            HandlerFunc[*dap.SourceRequest, *dap.SourceResponse]
 }

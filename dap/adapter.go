@@ -1,10 +1,12 @@
 package dap
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"path"
 	"sync"
 	"sync/atomic"
 
@@ -30,7 +32,8 @@ type Adapter[T any] struct {
 	threadsMu    sync.RWMutex
 	nextThreadID int
 
-	idPool *idPool
+	sourceMap sourceMap
+	idPool    *idPool
 }
 
 func New[T any](cfg *build.InvokeConfig) *Adapter[T] {
@@ -135,7 +138,7 @@ func (d *Adapter[T]) Continue(c Context, req *dap.ContinueRequest, resp *dap.Con
 	t := d.threads[req.Arguments.ThreadId]
 	d.threadsMu.RUnlock()
 
-	t.Continue(c)
+	t.Continue()
 	return nil
 }
 
@@ -144,7 +147,7 @@ func (d *Adapter[T]) Next(c Context, req *dap.NextRequest, resp *dap.NextRespons
 	t := d.threads[req.Arguments.ThreadId]
 	d.threadsMu.RUnlock()
 
-	t.Next(c)
+	t.Next()
 	return nil
 }
 
@@ -195,7 +198,7 @@ func (d *Adapter[T]) launch(c Context) {
 			started := c.Go(func(c Context) {
 				defer d.deleteThread(c, t)
 				defer close(req.errCh)
-				req.errCh <- t.Evaluate(c, req.c, req.ref, req.meta)
+				req.errCh <- t.Evaluate(c, req.c, req.ref, req.meta, req.inputs)
 			})
 
 			if !started {
@@ -210,9 +213,10 @@ func (d *Adapter[T]) newThread(ctx Context, name string) (t *thread) {
 	d.threadsMu.Lock()
 	id := d.nextThreadID
 	t = &thread{
-		id:     id,
-		name:   name,
-		idPool: d.idPool,
+		id:        id,
+		name:      name,
+		sourceMap: &d.sourceMap,
+		idPool:    d.idPool,
 	}
 	d.threads[t.id] = t
 	d.nextThreadID++
@@ -250,41 +254,43 @@ func (d *Adapter[T]) deleteThread(ctx Context, t *thread) {
 }
 
 type evaluateRequest struct {
-	name  string
-	c     gateway.Client
-	ref   gateway.Reference
-	meta  map[string][]byte
-	errCh chan<- error
+	name   string
+	c      gateway.Client
+	ref    gateway.Reference
+	meta   map[string][]byte
+	inputs build.Inputs
+	errCh  chan<- error
 }
 
-func (d *Adapter[T]) EvaluateResult(ctx context.Context, name string, c gateway.Client, res *gateway.Result) error {
+func (d *Adapter[T]) EvaluateResult(ctx context.Context, name string, c gateway.Client, res *gateway.Result, inputs build.Inputs) error {
 	eg, _ := errgroup.WithContext(ctx)
 	if res.Ref != nil {
 		eg.Go(func() error {
-			return d.evaluateRef(ctx, name, c, res.Ref, res.Metadata)
+			return d.evaluateRef(ctx, name, c, res.Ref, res.Metadata, inputs)
 		})
 	}
 
 	for k, ref := range res.Refs {
 		refName := fmt.Sprintf("%s (%s)", name, k)
 		eg.Go(func() error {
-			return d.evaluateRef(ctx, refName, c, ref, res.Metadata)
+			return d.evaluateRef(ctx, refName, c, ref, res.Metadata, inputs)
 		})
 	}
 	return eg.Wait()
 }
 
-func (d *Adapter[T]) evaluateRef(ctx context.Context, name string, c gateway.Client, ref gateway.Reference, meta map[string][]byte) error {
+func (d *Adapter[T]) evaluateRef(ctx context.Context, name string, c gateway.Client, ref gateway.Reference, meta map[string][]byte, inputs build.Inputs) error {
 	errCh := make(chan error, 1)
 
 	// Send a solve request to the launch routine
 	// which will perform the solve in the context of the server.
 	ereq := &evaluateRequest{
-		name:  name,
-		c:     c,
-		ref:   ref,
-		meta:  meta,
-		errCh: errCh,
+		name:   name,
+		c:      c,
+		ref:    ref,
+		meta:   meta,
+		inputs: inputs,
+		errCh:  errCh,
 	}
 	select {
 	case d.evaluateReqCh <- ereq:
@@ -325,12 +331,24 @@ func (d *Adapter[T]) StackTrace(c Context, req *dap.StackTraceRequest, resp *dap
 	return nil
 }
 
-func (d *Adapter[T]) evaluate(ctx context.Context, name string, c gateway.Client, res *gateway.Result) error {
+func (d *Adapter[T]) Source(c Context, req *dap.SourceRequest, resp *dap.SourceResponse) error {
+	fname := req.Arguments.Source.Path
+
+	dt, ok := d.sourceMap.Get(fname)
+	if !ok {
+		return errors.Errorf("file not found: %s", fname)
+	}
+
+	resp.Body.Content = string(dt)
+	return nil
+}
+
+func (d *Adapter[T]) evaluate(ctx context.Context, name string, c gateway.Client, res *gateway.Result, opt build.Options) error {
 	errCh := make(chan error, 1)
 
 	started := d.srv.Go(func(ctx Context) {
 		defer close(errCh)
-		errCh <- d.EvaluateResult(ctx, name, c, res)
+		errCh <- d.EvaluateResult(ctx, name, c, res, opt.Inputs)
 	})
 	if !started {
 		return context.Canceled
@@ -361,6 +379,7 @@ func (d *Adapter[T]) dapHandler() Handler {
 		Disconnect:        d.Disconnect,
 		Threads:           d.Threads,
 		StackTrace:        d.StackTrace,
+		Source:            d.Source,
 	}
 }
 
@@ -401,4 +420,53 @@ func (p *idPool) Get() int64 {
 
 func (p *idPool) Put(x int64) {
 	// noop
+}
+
+type sourceMap struct {
+	m  sync.Map
+	ws string
+}
+
+func (s *sourceMap) Put(c Context, fname string, dt []byte) {
+	for {
+		old, loaded := s.m.LoadOrStore(fname, dt)
+		if !loaded {
+			c.C() <- &dap.LoadedSourceEvent{
+				Event: dap.Event{Event: "loadedSource"},
+				Body: dap.LoadedSourceEventBody{
+					Reason: "new",
+					Source: dap.Source{
+						Name: path.Base(fname),
+						Path: fname,
+					},
+				},
+			}
+		}
+
+		if bytes.Equal(old.([]byte), dt) {
+			// Nothing to do.
+			return
+		}
+
+		if s.m.CompareAndSwap(fname, old, dt) {
+			c.C() <- &dap.LoadedSourceEvent{
+				Event: dap.Event{Event: "loadedSource"},
+				Body: dap.LoadedSourceEventBody{
+					Reason: "changed",
+					Source: dap.Source{
+						Name: path.Base(fname),
+						Path: fname,
+					},
+				},
+			}
+		}
+	}
+}
+
+func (s *sourceMap) Get(fname string) ([]byte, bool) {
+	v, ok := s.m.Load(fname)
+	if !ok {
+		return nil, false
+	}
+	return v.([]byte), true
 }

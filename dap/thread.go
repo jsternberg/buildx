@@ -2,6 +2,7 @@ package dap
 
 import (
 	"context"
+	"path/filepath"
 	"slices"
 	"sync"
 
@@ -17,14 +18,18 @@ import (
 
 type thread struct {
 	// Persistent data.
-	id     int
-	name   string
-	idPool *idPool
+	id   int
+	name string
+
+	// Persistent state from the adapter.
+	idPool    *idPool
+	sourceMap *sourceMap
 
 	// Inputs to the evaluate call.
-	c    gateway.Client
-	ref  gateway.Reference
-	meta map[string][]byte
+	c          gateway.Client
+	ref        gateway.Reference
+	meta       map[string][]byte
+	sourcePath string
 
 	// LLB state for the evaluate call.
 	def  *llb.Definition
@@ -62,8 +67,8 @@ const (
 	stepNext
 )
 
-func (t *thread) Evaluate(ctx Context, c gateway.Client, ref gateway.Reference, meta map[string][]byte) error {
-	if err := t.init(ctx, c, ref, meta); err != nil {
+func (t *thread) Evaluate(ctx Context, c gateway.Client, ref gateway.Reference, meta map[string][]byte, inputs build.Inputs) error {
+	if err := t.init(ctx, c, ref, meta, inputs); err != nil {
 		return err
 	}
 	defer t.reset()
@@ -80,16 +85,16 @@ func (t *thread) Evaluate(ctx Context, c gateway.Client, ref gateway.Reference, 
 		select {
 		case step = <-t.pause(ctx, err, reason, desc):
 		case <-ctx.Done():
-			t.Continue(ctx)
 			return context.Cause(ctx)
 		}
 	}
 }
 
-func (t *thread) init(ctx Context, c gateway.Client, ref gateway.Reference, meta map[string][]byte) error {
+func (t *thread) init(ctx Context, c gateway.Client, ref gateway.Reference, meta map[string][]byte, inputs build.Inputs) error {
 	t.c = c
 	t.ref = ref
 	t.meta = meta
+	t.sourcePath = inputs.ContextPath
 
 	if err := t.createRegions(ctx); err != nil {
 		return err
@@ -101,6 +106,7 @@ func (t *thread) reset() {
 	t.c = nil
 	t.ref = nil
 	t.meta = nil
+	t.sourcePath = ""
 	t.ops = nil
 }
 
@@ -144,11 +150,11 @@ func (t *thread) pause(c Context, err error, reason, desc string) <-chan stepTyp
 	return t.paused
 }
 
-func (t *thread) Continue(c Context) {
+func (t *thread) Continue() {
 	t.resume(stepContinue)
 }
 
-func (t *thread) Next(c Context) {
+func (t *thread) Next() {
 	t.resume(stepNext)
 }
 
@@ -194,11 +200,7 @@ func (t *thread) StackTrace() []dap.StackFrame {
 	return t.stackTrace
 }
 
-func (t *thread) getLLBState(ctx context.Context) error {
-	if t.head != "" {
-		return nil
-	}
-
+func (t *thread) getLLBState(ctx Context) error {
 	st, err := t.ref.ToState()
 	if err != nil {
 		return err
@@ -207,6 +209,11 @@ func (t *thread) getLLBState(ctx context.Context) error {
 	t.def, err = st.Marshal(ctx)
 	if err != nil {
 		return err
+	}
+
+	for _, src := range t.def.Source.Infos {
+		fname := filepath.Join(t.sourcePath, src.Filename)
+		t.sourceMap.Put(ctx, fname, src.Data)
 	}
 
 	t.ops = make(map[digest.Digest]*pb.Op, len(t.def.Def))
@@ -395,25 +402,36 @@ func (t *thread) nextDigest() digest.Digest {
 
 	// Look up the region associated with our current position.
 	// If we can't find it, just pretend we're using step continue.
-	index, ok := t.regionsByDigest[t.curPos]
+	region, ok := t.regionsByDigest[t.curPos]
 	if !ok {
 		return t.head
 	}
 
-	r := t.regions[index]
-	if i := slices.Index(r.digests, t.curPos); i >= 0 && i+1 < len(r.digests) {
-		// Retrieve the next step in our region. If we can't find ourselves
-		// in the region (problematic) or if we're at the end of the region (normal)
-		// then advance to the next one.
-		return r.digests[i+1]
-	}
+	r := t.regions[region]
+	i := slices.Index(r.digests, t.curPos) + 1
 
-	if index <= 0 {
-		// We're at the end of our execution. Should have been caught by
-		// t.head == t.curPos.
-		return ""
+	for {
+		if i >= len(r.digests) {
+			if region <= 0 {
+				// We're at the end of our execution. Should have been caught by
+				// t.head == t.curPos.
+				return ""
+			}
+			region--
+
+			r = t.regions[region]
+			i = 0
+			continue
+		}
+
+		next := r.digests[i]
+		if loc, ok := t.def.Source.Locations[string(next)]; !ok || len(loc.Locations) == 0 {
+			// Skip this digest because ti has no location in the source file.
+			i++
+			continue
+		}
+		return next
 	}
-	return t.regions[index-1].digests[0]
 }
 
 func (t *thread) solve(ctx context.Context, target digest.Digest) (gateway.Reference, error) {
@@ -466,7 +484,7 @@ func (t *thread) makeStackTrace() []dap.StackFrame {
 			fillStackFrameMetadata(&frame, meta)
 		}
 		if loc, ok := t.def.Source.Locations[string(dgst)]; ok {
-			fillStackFrameLocation(&frame, loc)
+			t.fillStackFrameLocation(&frame, loc)
 		}
 		frames = append(frames, frame)
 	}
@@ -482,9 +500,15 @@ func fillStackFrameMetadata(frame *dap.StackFrame, meta llb.OpMetadata) {
 	// TODO: should we infer the name from somewhere else?
 }
 
-func fillStackFrameLocation(frame *dap.StackFrame, loc *pb.Locations) {
+func (t *thread) fillStackFrameLocation(frame *dap.StackFrame, loc *pb.Locations) {
 	var ranges []*pb.Range
 	for _, l := range loc.Locations {
+		if frame.Source == nil {
+			info := t.def.Source.Infos[l.SourceIndex]
+			frame.Source = &dap.Source{
+				Path: filepath.Join(t.sourcePath, info.Filename),
+			}
+		}
 		ranges = append(ranges, l.Ranges...)
 	}
 
