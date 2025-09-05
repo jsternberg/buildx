@@ -2,6 +2,8 @@ package dap
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"path"
 	"path/filepath"
 	"sync"
@@ -10,6 +12,7 @@ import (
 	"github.com/docker/buildx/dap/common"
 	"github.com/google/go-dap"
 	"github.com/moby/buildkit/client/llb"
+	"github.com/moby/buildkit/frontend/gateway/client"
 	gateway "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/solver/errdefs"
 	"github.com/moby/buildkit/solver/pb"
@@ -292,6 +295,12 @@ func (t *thread) needsDebug(cur *step, step stepType, err error) (e dap.StoppedE
 	return
 }
 
+var log *os.File
+
+func init() {
+	log, _ = os.Create("/tmp/dap.txt")
+}
+
 func (t *thread) pause(c Context, ref gateway.Reference, err error, pos *step, event dap.StoppedEventBody) <-chan stepType {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -299,19 +308,47 @@ func (t *thread) pause(c Context, ref gateway.Reference, err error, pos *step, e
 	if t.paused != nil {
 		return t.paused
 	}
-
 	t.paused = make(chan stepType, 1)
+
+	var refsByPath map[string]gateway.MountReference
 	if err != nil {
-		var solveErr *errdefs.SolveError
-		if errors.As(err, &solveErr) {
-			if dt, err := solveErr.Op.MarshalVT(); err == nil {
-				t.curPos = digest.FromBytes(dt)
+		// If an error occurred, the reference we have might not work
+		// properly. Replace it with mount references that are included in the
+		// error.
+		//
+		// Need our client to support this capability.
+		fmt.Fprintf(log, "client type: %T\n", t.c)
+		if c, ok := t.c.(client.MountReferenceClient); ok {
+			var solveErr *errdefs.SolveError
+			if errors.As(err, &solveErr) {
+				switch op := solveErr.Op.GetOp().(type) {
+				case *pb.Op_Exec:
+					refsByPath = make(map[string]gateway.MountReference)
+					for i, m := range op.Exec.Mounts {
+						rid := m.ResultID
+						if rid == "" {
+							rid = solveErr.InputIDs[i]
+						}
+						fmt.Fprintf(log, "result id for %s: %s %s\n", m.Dest, m.ResultID, solveErr.InputIDs[i])
+
+						if rid == "" {
+							continue
+						}
+						refsByPath[m.Dest] = c.MountReference(rid)
+					}
+				}
 			}
+		} else {
+			fmt.Fprintf(log, "cannot retrieve a mount reference client\n")
 		}
 	}
 
+	if len(refsByPath) == 0 && ref != nil {
+		refsByPath = map[string]gateway.MountReference{"/": ref}
+	}
+
 	ctx, cancel := context.WithCancelCause(c)
-	t.collectStackTrace(ctx, pos, ref)
+	t.collectStackTrace(ctx, pos, refsByPath)
 	t.cancel = cancel
 
 	if ref != nil || err != nil {
@@ -574,12 +611,12 @@ func (t *thread) releaseState() {
 	t.variables.Reset()
 }
 
-func (t *thread) collectStackTrace(ctx context.Context, pos *step, ref gateway.Reference) {
+func (t *thread) collectStackTrace(ctx context.Context, pos *step, refsByPath map[string]gateway.MountReference) {
 	for pos != nil {
 		frame := pos.frame
-		frame.ExportVars(ctx, ref, t.variables)
+		frame.ExportVars(ctx, refsByPath, t.variables)
 		t.stackTrace = append(t.stackTrace, int32(frame.Id))
-		pos, ref = pos.out, nil
+		pos, refsByPath = pos.out, nil
 	}
 }
 

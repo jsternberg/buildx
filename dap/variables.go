@@ -53,10 +53,10 @@ func (f *frame) fillLocation(def *llb.Definition, loc *pb.Locations, ws string) 
 	}
 }
 
-func (f *frame) ExportVars(ctx context.Context, ref gateway.Reference, refs *variableReferences) {
+func (f *frame) ExportVars(ctx context.Context, refsByPath map[string]gateway.MountReference, refs *variableReferences) {
 	f.fillVarsFromOp(f.op, refs)
-	if ref != nil {
-		f.fillVarsFromResult(ctx, ref, refs)
+	if len(refsByPath) > 0 {
+		f.fillVarsFromResult(ctx, refsByPath, refs)
 	}
 }
 
@@ -172,18 +172,23 @@ func execOpVars(exec *pb.ExecOp, refs *variableReferences) dap.Variable {
 	}
 }
 
-func (f *frame) fillVarsFromResult(ctx context.Context, ref gateway.Reference, refs *variableReferences) {
+func (f *frame) fillVarsFromResult(ctx context.Context, refsByPath map[string]gateway.MountReference, refs *variableReferences) {
 	f.scopes = append(f.scopes, dap.Scope{
 		Name:             "File Explorer",
 		PresentationHint: "locals",
 		VariablesReference: refs.New(func() []dap.Variable {
-			return fsVars(ctx, ref, "/", refs)
+			return fsVars(ctx, refsByPath, "/", refs)
 		}),
 		Expensive: true,
 	})
 }
 
-func fsVars(ctx context.Context, ref gateway.Reference, path string, vars *variableReferences) []dap.Variable {
+func fsVars(ctx context.Context, refsByPath map[string]gateway.MountReference, path string, vars *variableReferences) []dap.Variable {
+	path, ref := lookupPath(path, refsByPath)
+	if ref == nil {
+		return nil
+	}
+
 	files, err := ref.ReadDir(ctx, gateway.ReadDirRequest{
 		Path: path,
 	})
@@ -214,7 +219,7 @@ func fsVars(ctx context.Context, ref gateway.Reference, path string, vars *varia
 						return statVars(file)
 					}),
 				}
-				return append([]dap.Variable{dvar}, fsVars(ctx, ref, fullpath, vars)...)
+				return append([]dap.Variable{dvar}, fsVars(ctx, refsByPath, fullpath, vars)...)
 			})
 			fv.Value = ""
 		} else {
@@ -238,7 +243,7 @@ func statf(st *types.Stat) string {
 	return fmt.Sprintf("%s %d:%d %s", mode, st.Uid, st.Gid, modTime.Format("Jan 2 15:04:05 2006"))
 }
 
-func fileVars(ctx context.Context, ref gateway.Reference, fullpath string) []dap.Variable {
+func fileVars(ctx context.Context, ref gateway.MountReference, fullpath string) []dap.Variable {
 	b, err := ref.ReadFile(ctx, gateway.ReadRequest{
 		Filename: fullpath,
 		Range:    &gateway.FileRange{Length: 512},
@@ -401,4 +406,16 @@ func brief(s string) string {
 		return s[:60] + " ..."
 	}
 	return s
+}
+
+func lookupPath(path string, refsByPath map[string]gateway.MountReference) (remainder string, ref gateway.MountReference) {
+	var prefix string
+	for p, r := range refsByPath {
+		if len(p) > len(prefix) && strings.HasPrefix(path, p) {
+			prefix = p
+			remainder, _ = filepath.Rel(prefix, p)
+			ref = r
+		}
+	}
+	return "/" + remainder, ref
 }

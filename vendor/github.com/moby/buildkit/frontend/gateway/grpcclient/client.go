@@ -293,6 +293,8 @@ func defaultLLBCaps() []*apicaps.PBCap {
 	}
 }
 
+var _ client.MountReferenceClient = (*grpcClient)(nil)
+
 type grpcClient struct {
 	client    pb.LLBBridgeClient
 	opts      map[string]string
@@ -863,6 +865,13 @@ func (w *msgWriter) Write(msg []byte) (int, error) {
 	return len(msg), nil
 }
 
+func (c *grpcClient) MountReference(resultID string) client.MountReference {
+	return &mountReference{
+		c:  c,
+		id: resultID,
+	}
+}
+
 func (c *grpcClient) NewContainer(ctx context.Context, req client.NewContainerRequest) (client.Container, error) {
 	err := c.caps.Supports(pb.CapGatewayExec)
 	if err != nil {
@@ -1189,6 +1198,33 @@ func (r *reference) Evaluate(ctx context.Context) error {
 }
 
 func (r *reference) ReadFile(ctx context.Context, req client.ReadRequest) ([]byte, error) {
+	m := r.mountReference()
+	return m.ReadFile(ctx, req)
+}
+
+func (r *reference) ReadDir(ctx context.Context, req client.ReadDirRequest) ([]*fstypes.Stat, error) {
+	m := r.mountReference()
+	return m.ReadDir(ctx, req)
+}
+
+func (r *reference) StatFile(ctx context.Context, req client.StatRequest) (*fstypes.Stat, error) {
+	m := r.mountReference()
+	return m.StatFile(ctx, req)
+}
+
+func (r *reference) mountReference() mountReference {
+	return mountReference{
+		c:  r.c,
+		id: r.id,
+	}
+}
+
+type mountReference struct {
+	c  *grpcClient
+	id string
+}
+
+func (r *mountReference) ReadFile(ctx context.Context, req client.ReadRequest) ([]byte, error) {
 	rfr := &pb.ReadFileRequest{FilePath: req.Filename, Ref: r.id}
 	if r := req.Range; r != nil {
 		rfr.Range = &pb.FileRange{
@@ -1203,7 +1239,7 @@ func (r *reference) ReadFile(ctx context.Context, req client.ReadRequest) ([]byt
 	return resp.Data, nil
 }
 
-func (r *reference) ReadDir(ctx context.Context, req client.ReadDirRequest) ([]*fstypes.Stat, error) {
+func (r *mountReference) ReadDir(ctx context.Context, req client.ReadDirRequest) ([]*fstypes.Stat, error) {
 	if err := r.c.caps.Supports(pb.CapReadDir); err != nil {
 		return nil, err
 	}
@@ -1219,7 +1255,7 @@ func (r *reference) ReadDir(ctx context.Context, req client.ReadDirRequest) ([]*
 	return resp.Entries, nil
 }
 
-func (r *reference) StatFile(ctx context.Context, req client.StatRequest) (*fstypes.Stat, error) {
+func (r *mountReference) StatFile(ctx context.Context, req client.StatRequest) (*fstypes.Stat, error) {
 	if err := r.c.caps.Supports(pb.CapStatFile); err != nil {
 		return nil, err
 	}

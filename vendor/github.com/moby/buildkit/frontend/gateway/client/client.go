@@ -36,6 +36,15 @@ type Client interface {
 	Warn(ctx context.Context, dgst digest.Digest, msg string, opts WarnOpts) error
 }
 
+// MountReferenceClient is a Client that can also retrieve a MountReference using
+// a resultID. If a Client has this capability, it will implement this interface.
+// Not all clients have this capability.
+type MountReferenceClient interface {
+	// MountReference will take the result ID and return a MountReference
+	// that can be used to retrieve filesystem contents.
+	MountReference(resultID string) MountReference
+}
+
 // NewContainerRequest encapsulates the requirements for a client to define a
 // new container, without defining the initial process.
 type NewContainerRequest struct {
@@ -101,6 +110,10 @@ type ContainerProcess interface {
 type Reference interface {
 	ToState() (llb.State, error)
 	Evaluate(ctx context.Context) error
+	MountReference
+}
+
+type MountReference interface {
 	ReadFile(ctx context.Context, req ReadRequest) ([]byte, error)
 	StatFile(ctx context.Context, req StatRequest) (*fstypes.Stat, error)
 	ReadDir(ctx context.Context, req ReadDirRequest) ([]*fstypes.Stat, error)

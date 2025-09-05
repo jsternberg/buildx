@@ -184,5 +184,7 @@ exclude (
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2
 )
 
+replace github.com/moby/buildkit => ../buildkit
+
 // restore junctions to have os.ModeSymlink flag set on Windows: https://github.com/docker/buildx/issues/3221
 godebug winsymlink=0
